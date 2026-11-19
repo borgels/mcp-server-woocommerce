@@ -51,7 +51,7 @@ const BASE_PATTERNS: readonly RegExp[] = [
   headerPattern('x-api-key'),
   // Any scheme word (Bearer, Basic, Token, ...) followed by the credentials.
   /["']?authorization["']?\s*[:=]\s*["']?(?:[a-z][\w-]*\s+)?[^"',\s}]+/gi,
-  /(apiKey|EXAMPLE_API_KEY|api_key|access_token)["']?\s*[:=]\s*["']?[^"',\s}]+/gi,
+  /(consumerKey|consumerSecret|consumer_key|consumer_secret|WOOCOMMERCE_CONSUMER_KEY|WOOCOMMERCE_CONSUMER_SECRET|api_key|access_token)["']?\s*[:=]\s*["']?[^"',\s}]+/gi,
 ];
 
 /**
@@ -62,6 +62,19 @@ const BASE_PATTERNS: readonly RegExp[] = [
  * runs several tenants in one process never mixes their keys, and a tenant's
  * key is released with its instance. There is no process-wide registry.
  */
+/**
+ * The URL-encoded form of a value. encodeURIComponent throws on a lone
+ * surrogate (text that is not valid UTF-16); such a value is encoded as its
+ * well-formed copy instead, so registering a secret never throws.
+ */
+function uriForm(value: string): string {
+  try {
+    return encodeURIComponent(value);
+  } catch {
+    return encodeURIComponent(value.replace(/[\uD800-\uDFFF]/g, '\uFFFD'));
+  }
+}
+
 export class SecretRedactor {
   private readonly secrets = new Set<string>();
   private readonly fragments = new Set<string>();
@@ -72,7 +85,7 @@ export class SecretRedactor {
     if (!value || value.length < MIN_SECRET_LENGTH) {
       return this;
     }
-    for (const form of new Set([value, encodeURIComponent(value), JSON.stringify(value).slice(1, -1)])) {
+    for (const form of new Set([value, uriForm(value), JSON.stringify(value).slice(1, -1)])) {
       this.secrets.add(form);
       for (let i = 0; i + FRAGMENT_LENGTH <= form.length; i += 1) {
         this.fragments.add(form.slice(i, i + FRAGMENT_LENGTH));
@@ -157,19 +170,24 @@ function applyPatterns(value: string, patterns: readonly RegExp[]): string {
   );
 }
 
-/** Our own guidance per HTTP status. Replace or extend with the vendor's documented statuses. */
+/**
+ * Our own guidance per HTTP status. The WooCommerce REST API documentation
+ * lists 400, 401, 404 and 500 with a body of `code`, `message` and `data`;
+ * that body is the shop's text and is never used.
+ */
 const STATUS_HINTS: Record<number, string> = {
-  401: 'The API key was rejected (invalid or expired). The server operator must renew EXAMPLE_API_KEY.',
-  403: 'The API key has no access to this resource. Retrying will not help.',
-  404: 'The object was not found, or the API key has no access to it. Check the ids.',
-  429: 'The upstream API is throttling requests. Wait and retry later.',
-};
+  400: 'The shop refused the request (a missing or invalid field). Check the ids and fields.',
+  401: 'The shop rejected the API key: it was revoked, or it lacks read/write permission. A shop manager makes a new key under WooCommerce -> Settings -> Advanced -> REST API.',
+  403: 'The API key has no permission for this. Retrying will not help.',
+  404: 'Not found in the shop, or the shop does not answer the WooCommerce REST API at this address (pretty permalinks must be on). Check the ids and the shop address.',
+  429: 'The shop is throttling requests. Wait and retry later.',
+}
 
 /**
  * An HTTP error from the upstream API. It keeps the status and the parsed
  * Retry-After, nothing from the response body: the message is our own.
  */
-export class ExampleHttpError extends Error {
+export class WooCommerceHttpError extends Error {
   readonly status: number;
   readonly url: string;
   /** Seconds to wait, parsed from Retry-After; undefined when absent or malformed. */
@@ -177,7 +195,7 @@ export class ExampleHttpError extends Error {
 
   constructor(input: { status: number; url: string; retryAfter?: string }) {
     super(httpErrorMessage(input.status, input.retryAfter));
-    this.name = 'ExampleHttpError';
+    this.name = 'WooCommerceHttpError';
     this.status = input.status;
     this.url = describeUrl(input.url);
     const retryMs = parseRetryAfterMs(input.retryAfter);
@@ -189,7 +207,7 @@ export class ExampleHttpError extends Error {
 export function httpErrorMessage(status: number, retryAfter?: string): string {
   const retryMs = parseRetryAfterMs(retryAfter);
   return [
-    `Example API request failed with HTTP ${status}`,
+    `WooCommerce API request failed with HTTP ${status}`,
     Object.hasOwn(STATUS_HINTS, status) ? STATUS_HINTS[status] : undefined,
     retryMs === undefined ? undefined : `retry-after=${Math.ceil(retryMs / 1000)}s`,
   ]
@@ -268,13 +286,13 @@ export function redactDeep(value: unknown, redactor?: SecretRedactor, depth = 0)
  * fixed text. Never the error's own message.
  */
 export function nestedFailureText(error: unknown): string {
-  if (error instanceof ExampleHttpError) {
-    return `Example API request failed with HTTP ${error.status}`;
+  if (error instanceof WooCommerceHttpError) {
+    return `WooCommerce API request failed with HTTP ${error.status}`;
   }
   if (error instanceof Error && (error.name === 'TimeoutError' || error.name === 'AbortError')) {
-    return 'Example API request timed out.';
+    return 'WooCommerce API request timed out.';
   }
-  return 'Example API request failed.';
+  return 'WooCommerce API request failed.';
 }
 
 /** Keys whose value is a failure context: anything inside that carries an error or a message is a failure. */
@@ -289,8 +307,8 @@ function failureEntry(value: unknown): { status?: number; message: string } {
   const status =
     typeof value === 'object' && value !== null && !Array.isArray(value) ? (value as Record<string, unknown>).status : undefined;
   return typeof status === 'number' && Number.isInteger(status) && status >= 100 && status <= 599
-    ? { status, message: `Example API request failed with HTTP ${status}` }
-    : { message: 'Example API request failed.' };
+    ? { status, message: `WooCommerce API request failed with HTTP ${status}` }
+    : { message: 'WooCommerce API request failed.' };
 }
 
 /** A failure list: every element (an object with any fields, a text, a list) becomes a failureEntry. */
@@ -335,8 +353,8 @@ export function nestedFailuresAsStatus(value: unknown, depth = 0, context = fals
   const present = (field: string) => Object.hasOwn(record, field) && record[field] !== null && record[field] !== undefined;
   if (failedStatus || present('error') || (context && FAILURE_FIELDS.some(present))) {
     return failedStatus
-      ? { status, error: `Example API request failed with HTTP ${status}` }
-      : { error: 'Example API request failed.' };
+      ? { status, error: `WooCommerce API request failed with HTTP ${status}` }
+      : { error: 'WooCommerce API request failed.' };
   }
   return Object.fromEntries(
     Object.entries(record).map(([key, entry]) => [

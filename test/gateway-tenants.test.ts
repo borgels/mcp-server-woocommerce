@@ -4,18 +4,18 @@ import { join } from 'node:path';
 import { setFlagsFromString } from 'node:v8';
 import { runInNewContext } from 'node:vm';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { API_KEY_HEADER, ExampleClient } from '../src/example/client.js';
-import { createExampleGateway, exampleGatewayTools, exampleToolCatalog } from '../src/gateway.js';
-import { EXAMPLE_TOOLS } from '../src/tools/example.js';
-import { BASE, auditLines, connect, stubFetch, texts } from './helpers.js';
+import { API_KEY_HEADER, WooCommerceClient } from '../src/woocommerce/client.js';
+import { createWooCommerceGateway, wooCommerceGatewayTools, wooCommerceToolCatalog, type GatewayJsonObject } from '../src/gateway.js';
+import { WOOCOMMERCE_TOOLS, pseudonym } from '../src/tools/woocommerce.js';
+import { BASE, auditLines, connect, stubFetch, texts, SECRET, SHOP } from './helpers.js';
 
 const originalEnv = { ...process.env };
 let dir: string;
 
 beforeEach(() => {
-  dir = mkdtempSync(join(tmpdir(), 'example-mcp-'));
+  dir = mkdtempSync(join(tmpdir(), 'woocommerce-mcp-'));
   for (const name of Object.keys(process.env)) {
-    if (name.startsWith('EXAMPLE_')) {
+    if (name.startsWith('WOOCOMMERCE_')) {
       delete process.env[name];
     }
   }
@@ -29,7 +29,7 @@ afterEach(() => {
 /** Placeholder credentials, built at runtime: long enough to be redacted by value. */
 const fakeKey = (label: string) => `${label}-${'x'.repeat(12)}`;
 // Keys with no piece of six characters in common: the redactor also removes any such piece of its own key.
-const KEY_A = 'alpha-0123456789-kq';
+const KEY_A = 'omega-0123456789-kq'; // gitleaks:allow (a test value, not a key)
 const KEY_B = 'bravo-zyxwvutsrq-MP';
 const ENV_KEY = 'envkey-ABCDEFGHIJ-77';
 
@@ -46,19 +46,27 @@ function headersOf(init?: RequestInit): Record<string, string> {
 }
 
 describe('explicit gateway credentials', () => {
-  it('requires apiKey and baseUrl and ignores the environment', () => {
-    process.env.EXAMPLE_API_KEY = ENV_KEY;
-    process.env.EXAMPLE_BASE_URL = BASE;
+  it('requires the key, the secret and the shop address, and ignores the environment', () => {
+    process.env.WOOCOMMERCE_CONSUMER_KEY = ENV_KEY;
+    process.env.WOOCOMMERCE_CONSUMER_SECRET = SECRET;
+    process.env.WOOCOMMERCE_SHOP_URL = SHOP;
 
-    expect(() => createExampleGateway({ baseUrl: BASE } as never)).toThrow(/requires options\.apiKey/);
-    expect(() => createExampleGateway({ apiKey: KEY_A } as never)).toThrow(/requires options\.baseUrl/);
-    expect(() => createExampleGateway({ apiKey: '  ', baseUrl: BASE })).toThrow(/requires options\.apiKey/);
-    expect(() => createExampleGateway(undefined as never)).toThrow(/requires options\.apiKey/);
+    expect(() => createWooCommerceGateway({ consumerSecret: SECRET, shopUrl: SHOP } as never)).toThrow(/requires options\.consumerKey/);
+    expect(() => createWooCommerceGateway({ consumerKey: '  ', consumerSecret: SECRET, shopUrl: SHOP })).toThrow(/requires options\.consumerKey/);
+    expect(() => createWooCommerceGateway({ consumerKey: KEY_A, shopUrl: SHOP } as never)).toThrow(/requires options\.consumerSecret/);
+    expect(() => createWooCommerceGateway({ consumerKey: KEY_A, consumerSecret: SECRET } as never)).toThrow(/requires options\.shopUrl/);
+    expect(() => createWooCommerceGateway(undefined as never)).toThrow(/requires options\.consumerKey/);
+  });
+
+  it('never lets an embedded instance reach a private address, whatever its options say', () => {
+    expect(() =>
+      createWooCommerceGateway({ consumerKey: KEY_A, consumerSecret: SECRET, shopUrl: 'http://127.0.0.1:8080', allowPrivateHost: true } as never),
+    ).toThrow();
   });
 
   it('never reads credential variables from process.env, even when they are set', async () => {
     const reads = new Set<string>();
-    const env = { ...process.env, EXAMPLE_API_KEY: ENV_KEY, EXAMPLE_BASE_URL: BASE };
+    const env = { ...process.env, WOOCOMMERCE_CONSUMER_KEY: ENV_KEY, WOOCOMMERCE_CONSUMER_SECRET: SECRET, WOOCOMMERCE_SHOP_URL: SHOP };
     process.env = new Proxy(env, {
       get(target, property, receiver) {
         if (typeof property === 'string') {
@@ -68,42 +76,43 @@ describe('explicit gateway credentials', () => {
       },
     });
 
-    expect(() => createExampleGateway({ baseUrl: BASE } as never)).toThrow(/requires options\.apiKey/);
+    expect(() => createWooCommerceGateway({ shopUrl: SHOP } as never)).toThrow(/requires options\.consumerKey/);
 
-    const fetchImpl = stubFetch({ [`GET ${BASE}/items/i1`]: { body: { id: 'i1' } } });
-    const gw = createExampleGateway({ apiKey: KEY_A, baseUrl: BASE, fetchImpl: fetchImpl as unknown as typeof fetch });
-    const result = await gw.callTool('get_item', { itemId: 'i1' });
+    const fetchImpl = stubFetch({ [`GET ${BASE}/customers/12`]: { body: { id: 12 } } });
+    const gw = createWooCommerceGateway({ consumerKey: KEY_A, consumerSecret: SECRET, shopUrl: SHOP, fetchImpl: fetchImpl as unknown as typeof fetch });
+    const result = await gw.callTool('get_customer', { customerId: 12 });
     expect(result.isError).toBeUndefined();
-    expect(headersOf(fetchImpl.mock.calls[0]?.[1])[API_KEY_HEADER]).toBe(KEY_A);
+    expect(headersOf(fetchImpl.mock.calls[0]?.[1])[API_KEY_HEADER]).toBe(`Basic ${Buffer.from(`${KEY_A}:${SECRET}`).toString('base64')}`);
 
-    expect(reads.has('EXAMPLE_API_KEY')).toBe(false);
-    expect(reads.has('EXAMPLE_BASE_URL')).toBe(false);
+    for (const name of ['WOOCOMMERCE_CONSUMER_KEY', 'WOOCOMMERCE_CONSUMER_SECRET', 'WOOCOMMERCE_SHOP_URL']) expect(reads.has(name)).toBe(false);
   });
 
   it('still reads credentials from the environment in the standalone client', async () => {
-    process.env.EXAMPLE_API_KEY = ENV_KEY;
-    process.env.EXAMPLE_BASE_URL = BASE;
+    process.env.WOOCOMMERCE_CONSUMER_KEY = ENV_KEY;
+    process.env.WOOCOMMERCE_CONSUMER_SECRET = SECRET;
+    process.env.WOOCOMMERCE_SHOP_URL = SHOP;
     const fetchImpl = vi.fn(async () => Response.json({})) as unknown as typeof fetch & ReturnType<typeof vi.fn>;
-    await new ExampleClient({ fetchImpl }).get('/items/1');
-    expect(headersOf(fetchImpl.mock.calls[0]?.[1] as RequestInit)[API_KEY_HEADER]).toBe(ENV_KEY);
+    await new WooCommerceClient({ fetchImpl }).get('/customers/1');
+    expect(String(fetchImpl.mock.calls[0]?.[0])).toBe(`${BASE}/customers/1`);
+    expect(headersOf(fetchImpl.mock.calls[0]?.[1] as RequestInit)[API_KEY_HEADER]).toBe(`Basic ${Buffer.from(`${ENV_KEY}:${SECRET}`).toString('base64')}`);
   });
 });
 
 describe('per-instance redaction', () => {
   it('redacts each instance’s own key in its tool results', async () => {
-    const a = createExampleGateway({ apiKey: KEY_A, baseUrl: BASE, fetchImpl: echoingFetch(KEY_A) });
-    const b = createExampleGateway({ apiKey: KEY_B, baseUrl: BASE, fetchImpl: echoingFetch(KEY_B) });
+    const a = createWooCommerceGateway({ consumerKey: KEY_A, consumerSecret: SECRET, shopUrl: SHOP, fetchImpl: echoingFetch(KEY_A) });
+    const b = createWooCommerceGateway({ consumerKey: KEY_B, consumerSecret: SECRET, shopUrl: SHOP, fetchImpl: echoingFetch(KEY_B) });
 
-    const resultA = texts(await a.callTool('get_item', { itemId: 'i1' })).join(' ');
-    const resultB = texts(await b.callTool('get_item', { itemId: 'i1' })).join(' ');
+    const resultA = texts(await a.callTool('get_customer', { customerId: 12 })).join(' ');
+    const resultB = texts(await b.callTool('get_customer', { customerId: 12 })).join(' ');
     // The echoing error body is never read into the result; the key is not there in any form.
     expect(resultA).not.toContain(KEY_A);
     expect(resultB).not.toContain(KEY_B);
   });
 
   it('keeps redactors separate: an instance holds only its own secrets', () => {
-    const a = new ExampleClient({ apiKey: KEY_A, baseUrl: BASE, credentialEnv: {} });
-    const b = new ExampleClient({ apiKey: KEY_B, baseUrl: BASE, credentialEnv: {} });
+    const a = new WooCommerceClient({ consumerKey: KEY_A, consumerSecret: SECRET, shopUrl: SHOP, credentialEnv: {} });
+    const b = new WooCommerceClient({ consumerKey: KEY_B, consumerSecret: SECRET, shopUrl: SHOP, credentialEnv: {} });
     expect(a.redactor.hasSecret(KEY_A)).toBe(true);
     expect(a.redactor.hasSecret(KEY_B)).toBe(false);
     expect(b.redactor.hasSecret(KEY_B)).toBe(true);
@@ -114,39 +123,39 @@ describe('per-instance redaction', () => {
 
   it('does not accumulate keys of earlier instances', () => {
     for (let index = 0; index < 200; index += 1) {
-      createExampleGateway({ apiKey: `short-lived-key-${index}`, baseUrl: BASE });
+      createWooCommerceGateway({ consumerKey: `short-lived-key-${index}`, consumerSecret: SECRET, shopUrl: SHOP });
     }
-    const fresh = new ExampleClient({ apiKey: KEY_A, baseUrl: BASE, credentialEnv: {} });
+    const fresh = new WooCommerceClient({ consumerKey: KEY_A, consumerSecret: SECRET, shopUrl: SHOP, credentialEnv: {} });
     expect(fresh.redactor.redact('short-lived-key-7')).toBe('short-lived-key-7');
   });
 
   it('redacts audit records with the key of the instance that ran the call', async () => {
-    process.env.EXAMPLE_AUDIT_LOG = join(dir, 'audit.jsonl');
+    process.env.WOOCOMMERCE_AUDIT_LOG = join(dir, 'audit.jsonl');
     const failing = (key: string) =>
       vi.fn(async () => {
         throw new TypeError(`connection refused while sending ${key}`);
       }) as unknown as typeof fetch;
-    const a = createExampleGateway({ apiKey: KEY_A, baseUrl: BASE, fetchImpl: failing(KEY_A), maxAttempts: 1 });
-    const b = createExampleGateway({ apiKey: KEY_B, baseUrl: BASE, fetchImpl: failing(KEY_B), maxAttempts: 1 });
-    await a.callTool('get_item', { itemId: 'i1' }, { requestId: 'a' });
-    await b.callTool('get_item', { itemId: 'i1' }, { requestId: 'b' });
+    const a = createWooCommerceGateway({ consumerKey: KEY_A, consumerSecret: SECRET, shopUrl: SHOP, fetchImpl: failing(KEY_A), maxAttempts: 1 });
+    const b = createWooCommerceGateway({ consumerKey: KEY_B, consumerSecret: SECRET, shopUrl: SHOP, fetchImpl: failing(KEY_B), maxAttempts: 1 });
+    await a.callTool('get_customer', { customerId: 12 }, { requestId: 'a' });
+    await b.callTool('get_customer', { customerId: 12 }, { requestId: 'b' });
 
-    const errors = auditLines(process.env.EXAMPLE_AUDIT_LOG).filter(line => line.action === 'error');
-    expect(errors.map(line => line.requestId)).toEqual(['a', 'b']);
+    const errors = auditLines(process.env.WOOCOMMERCE_AUDIT_LOG).filter(line => line.action === 'error');
+    expect(errors.map(line => line.requestId)).toEqual([pseudonym('a'), pseudonym('b')]);
     const log = JSON.stringify(errors);
     expect(log).not.toContain(KEY_A);
     expect(log).not.toContain(KEY_B);
   });
 
   it('redacts with the server client’s key on the MCP path', async () => {
-    const tool = EXAMPLE_TOOLS.find(t => t.name === 'example_get_item')!;
+    const tool = WOOCOMMERCE_TOOLS.find(t => t.name === 'woocommerce_get_customer')!;
     const original = tool.handler;
     tool.handler = async () => {
       throw new Error('failed with test-api-key');
     };
     try {
       const { mcpClient } = await connect();
-      const result = await mcpClient.callTool({ name: 'example_get_item', arguments: { itemId: 'i1' } });
+      const result = await mcpClient.callTool({ name: 'woocommerce_get_customer', arguments: { customerId: 12 } });
       expect(texts(result).join(' ')).not.toContain('test-api-key');
     } finally {
       tool.handler = original;
@@ -156,9 +165,10 @@ describe('per-instance redaction', () => {
   it('lets a dropped instance and its key be garbage collected', async () => {
     setFlagsFromString('--expose-gc');
     const gc = runInNewContext('gc') as () => void;
-    let gateway: ReturnType<typeof createExampleGateway> | undefined = createExampleGateway({
-      apiKey: fakeKey('collectable'),
-      baseUrl: BASE,
+    let gateway: ReturnType<typeof createWooCommerceGateway> | undefined = createWooCommerceGateway({
+      consumerKey: fakeKey('collectable'),
+      consumerSecret: SECRET,
+      shopUrl: SHOP,
     });
     const ref = new WeakRef(gateway);
     gateway = undefined;
@@ -171,19 +181,61 @@ describe('per-instance redaction', () => {
 });
 
 /** Sample input per tool, used to check each tool's declared upstream requests. */
-const SAMPLE_INPUTS: Record<string, Record<string, string>> = {
-  get_item: { itemId: 'i1' },
-  create_item: { name: 'New item' },
+const SAMPLE_INPUTS: Record<string, GatewayJsonObject> = {
+  check_connection: {},
+  get_sales_report: { period: 'month' },
+  list_orders: { status: 'processing', after: '2026-11-01' },
+  get_order: { orderId: 12 },
+  list_order_notes: { orderId: 12 },
+  list_order_refunds: { orderId: 12 },
+  list_products: { stock_status: 'outofstock' },
+  get_product: { productId: 31 },
+  list_customers: { search: 'a' },
+  get_customer: { customerId: 21 },
+  update_order_status: { orderId: 12, status: 'completed' },
+  add_order_note: { orderId: 12, note: 'Packed' },
+  record_refund: { orderId: 12, amount: 50, currency: 'DKK' },
+  create_draft_product: { name: 'New product', regular_price: '100.00' },
+  update_product: { productId: 31, stock_quantity: 4, manage_stock: true },
+  update_customer: { customerId: 21, billing: { phone: '12345678' } },
 };
+
+/** Answers that let every tool run to its end: a processing order of 100 DKK, a sales report, the record asked for. */
+async function catalogFetch(input: string | URL | Request, init?: RequestInit): Promise<Response> {
+  const path = new URL(String(input)).pathname;
+  const method = init?.method ?? 'GET';
+  if (path.endsWith('/reports/sales')) return Response.json([{ total_sales: '100.00', net_sales: '80.00' }]);
+  const orderId = /\/orders\/(\d+)$/.exec(path)?.[1];
+  if (orderId) {
+    const status = method === 'PUT' ? (JSON.parse(String(init?.body)) as { status: string }).status : 'processing';
+    return Response.json({ id: Number(orderId), status, currency: 'DKK', total: '100.00', refunds: [], line_items: [] });
+  }
+  if (method === 'GET' && /\/orders$/.test(path)) return Response.json([{ id: 1, status: 'processing' }]);
+  if (method === 'GET' && /\/(products|customers|notes|refunds)$/.test(path)) return Response.json([{ id: 1 }]);
+  const recordId = /\/(\d+)$/.exec(path)?.[1];
+  if (method === 'POST' && path.endsWith('/products')) return Response.json({ id: 1, status: 'draft' });
+  if (method === 'POST' && path.endsWith('/notes')) return Response.json({ id: 1, customer_note: false });
+  if (method === 'PUT' && /\/(products|customers)\/\d+$/.test(path)) {
+    return Response.json({ id: Number(/(\d+)$/.exec(path)?.[1]), ...(JSON.parse(String(init?.body)) as object) });
+  }
+  if (method === 'POST' && path.endsWith('/refunds')) {
+    const { amount } = JSON.parse(String(init?.body)) as { amount: string };
+    return Response.json({ id: 1, amount, refunded_payment: false });
+  }
+  return Response.json({ id: recordId ? Number(recordId) : 1 });
+}
 
 describe('tool catalog', () => {
   it('lists every registered tool, matching the gateway definitions', async () => {
-    expect(exampleToolCatalog.map(entry => entry.name)).toEqual(exampleGatewayTools.map(tool => tool.name));
-    for (const entry of exampleToolCatalog) {
-      const { upstream, broad, ...definition } = entry;
+    expect(wooCommerceToolCatalog.map(entry => entry.name)).toEqual(wooCommerceGatewayTools.map(tool => tool.name));
+    for (const entry of wooCommerceToolCatalog) {
+      const { upstream, broad, requiresConfirmation, change, ...definition } = entry;
+      expect(typeof requiresConfirmation).toBe('boolean');
+      expect(change === undefined).toBe(entry.riskLevel === 'read');
+      if (requiresConfirmation) expect(entry.riskLevel).toBe('write');
       expect(typeof broad).toBe('boolean');
       if (broad) expect(entry.riskLevel).toBe('read');
-      expect(definition).toEqual(exampleGatewayTools.find(tool => tool.name === entry.name));
+      expect(definition).toEqual(wooCommerceGatewayTools.find(tool => tool.name === entry.name));
       expect(upstream.length).toBeGreaterThan(0);
       for (const operation of upstream) {
         expect(operation.access === 'read' ? operation.method === 'GET' : true).toBe(true);
@@ -196,10 +248,10 @@ describe('tool catalog', () => {
     const { mcpClient } = await connect();
     const { tools } = await mcpClient.listTools();
     expect(tools.map(tool => tool.name).sort()).toEqual(
-      exampleToolCatalog.map(entry => `example_${entry.name}`).sort(),
+      wooCommerceToolCatalog.map(entry => `woocommerce_${entry.name}`).sort(),
     );
     for (const tool of tools) {
-      const entry = exampleToolCatalog.find(e => `example_${e.name}` === tool.name)!;
+      const entry = wooCommerceToolCatalog.find(e => `woocommerce_${e.name}` === tool.name)!;
       expect(entry.title).toBe(tool.title);
       expect(entry.description).toBe(tool.description);
       expect(Object.keys(entry.inputSchema.properties as object).sort()).toEqual(
@@ -209,32 +261,32 @@ describe('tool catalog', () => {
   });
 
   it('is deeply frozen', () => {
-    expect(Object.isFrozen(exampleToolCatalog)).toBe(true);
+    expect(Object.isFrozen(wooCommerceToolCatalog)).toBe(true);
     const visit = (value: unknown) => {
       if (typeof value === 'object' && value !== null) {
         expect(Object.isFrozen(value)).toBe(true);
         Object.values(value).forEach(visit);
       }
     };
-    visit(exampleToolCatalog);
+    visit(wooCommerceToolCatalog);
     expect(() => {
-      (exampleToolCatalog[0] as { name: string }).name = 'changed';
+      (wooCommerceToolCatalog[0] as { name: string }).name = 'changed';
     }).toThrow(TypeError);
   });
 
   it('declares exactly the upstream requests each tool makes', async () => {
-    process.env.EXAMPLE_ENABLE_WRITES = 'true';
-    for (const entry of exampleToolCatalog) {
+    process.env.WOOCOMMERCE_ENABLE_WRITES = 'true';
+    for (const entry of wooCommerceToolCatalog) {
       const input = SAMPLE_INPUTS[entry.name];
       expect(input, `sample input for ${entry.name}`).toBeDefined();
-      const fetchImpl = vi.fn(async () => Response.json({ ok: true }));
-      const gw = createExampleGateway({ apiKey: KEY_A, baseUrl: BASE, fetchImpl: fetchImpl as unknown as typeof fetch });
+      const fetchImpl = vi.fn(catalogFetch);
+      const gw = createWooCommerceGateway({ consumerKey: KEY_A, consumerSecret: SECRET, shopUrl: SHOP, fetchImpl: fetchImpl as unknown as typeof fetch });
       const result = await gw.callTool(entry.name, input!);
-      expect(result.isError, texts(result).join(' ')).toBeUndefined();
+      expect(result.isError, `${entry.name}: ${texts(result).join(" ")}`).toBeUndefined();
 
       const declared = entry.upstream.map(op => ({
         method: op.method,
-        path: op.path.replace(/\{(\w+)\}/g, (_, name: string) => encodeURIComponent(input![name] ?? '')),
+        path: op.path.replace(/\{(\w+)\}/g, (_, name: string) => encodeURIComponent(String(input![name] ?? ''))),
       }));
       const made = (fetchImpl.mock.calls as unknown as Array<[string, RequestInit]>).map(([url, init]) => ({
         method: init.method,

@@ -6,8 +6,8 @@ import type { SecretRedactor } from '../errors.js';
  * Server-side guards that apply to every tool call, whether it arrives over
  * MCP or through the embeddable gateway entry point.
  *
- * - Write tools are opt-in per instance (EXAMPLE_ENABLE_WRITES=true).
- * - EXAMPLE_DISABLED_TOOLS turns individual tools off; they are not even
+ * - Write tools are opt-in per instance (WOOCOMMERCE_ENABLE_WRITES=true).
+ * - WOOCOMMERCE_DISABLED_TOOLS turns individual tools off; they are not even
  *   registered.
  *
  * The template has no input allowlists. A server that adds one (account or
@@ -38,11 +38,17 @@ export interface InstancePolicy {
   disabledTools?: readonly string[];
   /**
    * Receives every audit record of this instance's calls, instead of
-   * EXAMPLE_AUDIT_LOG. Without it the instance writes no audit records. A
+   * WOOCOMMERCE_AUDIT_LOG. Without it the instance writes no audit records. A
    * write tool runs only if its start record was accepted, so a sink that
    * throws refuses the write.
    */
   audit?: AuditSink;
+  /**
+   * Key for the pseudonym of the caller in audit records (HMAC-SHA-256). The
+   * caller a host passes is never logged in clear; without a key it is a
+   * plain SHA-256 pseudonym, which a list of guesses can reverse.
+   */
+  pseudonymKey?: string | Uint8Array;
 }
 
 /** An InstancePolicy, checked and normalised. */
@@ -50,6 +56,7 @@ export interface ResolvedInstancePolicy {
   readonly enableWrites: boolean;
   readonly disabledTools: ReadonlySet<string>;
   readonly audit?: AuditSink;
+  readonly pseudonymKey?: string | Uint8Array;
 }
 
 /** What one gateway call runs under: the host's policy (none: the environment applies) and the instance's redactor. */
@@ -74,6 +81,10 @@ export function resolveInstancePolicy(policy: InstancePolicy, knownTools: readon
   if (policy.audit !== undefined && typeof policy.audit !== 'function') {
     throw new ConfigError('policy.audit must be a function');
   }
+  const key = policy.pseudonymKey;
+  if (key !== undefined && !((typeof key === 'string' || key instanceof Uint8Array) && key.length >= 32)) {
+    throw new ConfigError('policy.pseudonymKey must be a string of at least 32 characters or at least 32 bytes.');
+  }
   const known = new Set(knownTools);
   const disabled = new Set<string>();
   for (const [index, name] of (policy.disabledTools ?? []).entries()) {
@@ -87,6 +98,7 @@ export function resolveInstancePolicy(policy: InstancePolicy, knownTools: readon
     enableWrites: policy.enableWrites === true,
     disabledTools: disabled,
     ...(policy.audit ? { audit: policy.audit } : {}),
+    ...(policy.pseudonymKey ? { pseudonymKey: policy.pseudonymKey } : {}),
   });
 }
 
@@ -120,14 +132,14 @@ export interface PolicyDecision {
   reason: string;
 }
 
-export const TOOL_PREFIX = 'example_';
+export const TOOL_PREFIX = 'woocommerce_';
 
 export function writesEnabled(): boolean {
   const hosted = currentInstancePolicy();
   if (hosted) {
     return hosted.enableWrites;
   }
-  return readEnvBoolean('EXAMPLE_ENABLE_WRITES', false);
+  return readEnvBoolean('WOOCOMMERCE_ENABLE_WRITES', false);
 }
 
 /** Tool names are accepted with or without the prefix, case-insensitively. */
@@ -141,7 +153,7 @@ function disabledTools(): ReadonlySet<string> {
   if (hosted) {
     return hosted.disabledTools;
   }
-  return new Set(readEnvList('EXAMPLE_DISABLED_TOOLS').map(canonicalToolName));
+  return new Set(readEnvList('WOOCOMMERCE_DISABLED_TOOLS').map(canonicalToolName));
 }
 
 export function isToolDisabled(toolName: string): boolean {
@@ -150,7 +162,7 @@ export function isToolDisabled(toolName: string): boolean {
 
 /**
  * Validate the policy environment once at startup: boolean switches must be
- * valid and EXAMPLE_DISABLED_TOOLS may only name known tools, so a typo
+ * valid and WOOCOMMERCE_DISABLED_TOOLS may only name known tools, so a typo
  * cannot silently leave a tool enabled.
  */
 export function validatePolicyConfig(knownTools: readonly string[]): void {
@@ -159,13 +171,13 @@ export function validatePolicyConfig(knownTools: readonly string[]): void {
   const unknown = [...disabledTools()].filter(name => !known.has(name));
   if (unknown.length > 0) {
     // The names are not quoted: a configuration value is never echoed, not even shortened.
-    throw new ConfigError(`EXAMPLE_DISABLED_TOOLS names ${unknown.length} unknown tool(s).`);
+    throw new ConfigError(`WOOCOMMERCE_DISABLED_TOOLS names ${unknown.length} unknown tool(s).`);
   }
 }
 
 export function checkToolPolicy(toolName: string, readOnly: boolean): PolicyDecision {
   if (isToolDisabled(toolName)) {
-    const source = currentInstancePolicy() ? 'by the embedding host' : '(EXAMPLE_DISABLED_TOOLS)';
+    const source = currentInstancePolicy() ? 'by the embedding host' : '(WOOCOMMERCE_DISABLED_TOOLS)';
     return { allowed: false, reason: `tool is disabled on this instance ${source}: ${toolName}` };
   }
   if (readOnly) {
@@ -178,7 +190,7 @@ export function checkToolPolicy(toolName: string, readOnly: boolean): PolicyDeci
         `write tool is disabled on this instance: ${toolName}. ` +
         (currentInstancePolicy()
           ? 'The embedding host has not enabled writes for this instance.'
-          : 'Set EXAMPLE_ENABLE_WRITES=true in the server environment to allow write tools.'),
+          : 'Set WOOCOMMERCE_ENABLE_WRITES=true in the server environment to allow write tools.'),
     };
   }
   return { allowed: true, reason: 'write tool (writes enabled on this instance)' };

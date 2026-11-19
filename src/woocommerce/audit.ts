@@ -2,7 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { accessSync, constants, statSync } from 'node:fs';
 import { appendFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
-import { ExampleHttpError, formatUnknownError, redactDeep, redactSecrets, type SecretRedactor } from '../errors.js';
+import { WooCommerceHttpError, formatUnknownError, redactDeep, redactSecrets, type SecretRedactor } from '../errors.js';
 import { STDERR_WITHHELD, withheldAuditRecord } from '../fallbacks.js';
 import { leaksSecret } from '../key-admission.js';
 import { ConfigError, readEnvString } from '../config-env.js';
@@ -33,10 +33,10 @@ export function auditErrorSummary(
   error: unknown,
   redactor?: SecretRedactor,
 ): { httpStatus?: number; message: string } {
-  if (error instanceof ExampleHttpError) {
+  if (error instanceof WooCommerceHttpError) {
     return {
       httpStatus: error.status,
-      message: `Example API request failed with HTTP ${error.status}`,
+      message: `WooCommerce API request failed with HTTP ${error.status}`,
     };
   }
   const message = formatUnknownError(error, redactor);
@@ -50,12 +50,12 @@ export function newRequestId(): string {
 }
 
 /**
- * Startup check: when EXAMPLE_AUDIT_LOG is set, its directory must exist and
+ * Startup check: when WOOCOMMERCE_AUDIT_LOG is set, its directory must exist and
  * be writable (and the file, if it exists, writable), so a typo fails at
  * startup rather than refusing every write tool call later.
  */
 export function assertAuditLogWritable(): void {
-  const auditPath = readEnvString('EXAMPLE_AUDIT_LOG');
+  const auditPath = readEnvString('WOOCOMMERCE_AUDIT_LOG');
   if (!auditPath) {
     return;
   }
@@ -63,14 +63,14 @@ export function assertAuditLogWritable(): void {
     const existing = statSync(auditPath, { throwIfNoEntry: false });
     accessSync(existing ? auditPath : dirname(auditPath), constants.W_OK);
   } catch {
-    throw new ConfigError('EXAMPLE_AUDIT_LOG is not writable.');
+    throw new ConfigError('WOOCOMMERCE_AUDIT_LOG is not writable.');
   }
 }
 
 /**
- * Append one JSON line to EXAMPLE_AUDIT_LOG (no-op when unset). Under a
+ * Append one JSON line to WOOCOMMERCE_AUDIT_LOG (no-op when unset). Under a
  * host's InstancePolicy the record goes to the policy's `audit` sink instead
- * (no-op without one), and EXAMPLE_AUDIT_LOG is not read.
+ * (no-op without one), and WOOCOMMERCE_AUDIT_LOG is not read.
  *
  * By default a failing audit sink is reported on stderr and does not change
  * the tool result: after a call has run, surfacing an error would invite a
@@ -85,7 +85,7 @@ export async function writeAuditEvent(
 ): Promise<void> {
   const hosted = currentInstancePolicy();
   const sink = hosted?.audit;
-  const auditPath = hosted ? undefined : readEnvString('EXAMPLE_AUDIT_LOG');
+  const auditPath = hosted ? undefined : readEnvString('WOOCOMMERCE_AUDIT_LOG');
   if (!sink && !auditPath) {
     return;
   }
@@ -125,10 +125,10 @@ export async function writeAuditEvent(
       // Details (path, OS error) go to stderr only, not to the caller.
       const tool = formatUnknownError(event.tool, redactor);
       // The whole line, prefix included, through the redactor and then the sink check.
-      stderrLine(redactSecrets(`[example-mcp] audit log write failed, refusing ${tool}: ${formatUnknownError(error, redactor)}`, redactor));
+      stderrLine(redactSecrets(`[woocommerce-mcp] audit log write failed, refusing ${tool}: ${formatUnknownError(error, redactor)}`, redactor));
       throw new Error(`Audit log is not writable on this instance; ${tool} was not run.`);
     }
-    stderrLine(redactSecrets(`[example-mcp] audit log write failed: ${formatUnknownError(error, redactor)}`, redactor));
+    stderrLine(redactSecrets(`[woocommerce-mcp] audit log write failed: ${formatUnknownError(error, redactor)}`, redactor));
   }
 }
 
@@ -136,14 +136,42 @@ function errorFields(summary: ReturnType<typeof auditErrorSummary>) {
   return { httpStatus: summary.httpStatus, error: summary.message };
 }
 
-/** Identifier fields logged in clear text: they are opaque ids, not secrets. Extend per tool. */
-const ID_FIELDS = ['itemId'] as const;
+/**
+ * Fields logged in clear text: WooCommerce ids (integers), dates, amounts,
+ * currency codes and values from the tools' fixed lists. Input is validated
+ * against the tool's schema before it is audited.
+ */
+const ID_FIELDS = [
+  'orderId',
+  'productId',
+  'customerId',
+  'customer',
+  'product',
+  'category',
+  'status',
+  'stock_status',
+  'type',
+  'period',
+  'dateMin',
+  'dateMax',
+  'after',
+  'before',
+  'amount',
+  'currency',
+  'manage_stock',
+  'page',
+  'perPage',
+] as const;
 
-/** Free-text fields are hashed so user-written text does not land in the log. */
-const FREE_TEXT_FIELDS = ['name', 'query'] as const;
+/**
+ * Search text, SKUs and product names are hashed so text a person wrote does
+ * not land in the log. Names, e-mail addresses, addresses, phone numbers,
+ * notes and refund reasons are not logged at all, not even hashed.
+ */
+const FREE_TEXT_FIELDS = ['search', 'sku', 'name'] as const;
 
-/** Write payload objects: only their field names are logged. */
-const PAYLOAD_FIELDS = ['body', 'patch'] as const;
+/** Nothing is logged as a list in this server. */
+const LIST_FIELDS = [] as const;
 
 /** Build the audit `target` for a tool input. Values not listed above are not logged. */
 export function auditTarget(input: unknown): Record<string, unknown> | undefined {
@@ -166,10 +194,9 @@ export function auditTarget(input: unknown): Record<string, unknown> | undefined
     }
   }
 
-  for (const field of PAYLOAD_FIELDS) {
-    const payload = value[field];
-    if (payload && typeof payload === 'object' && !Array.isArray(payload)) {
-      target[`${field}Fields`] = Object.keys(payload).sort();
+  for (const field of LIST_FIELDS) {
+    if (Array.isArray(value[field])) {
+      target[`${field}Count`] = (value[field] as unknown[]).length;
     }
   }
 

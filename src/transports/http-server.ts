@@ -8,7 +8,7 @@ import {
 import type { AddressInfo } from 'node:net';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
-import { createServer as createExampleMcpServer } from '../server.js';
+import { createServer as createWooCommerceMcpServer } from '../server.js';
 import {
   assertAllowedHost,
   assertAllowedOrigin,
@@ -42,7 +42,7 @@ export interface RunningHttpServer {
 const DEFAULT_SHUTDOWN_GRACE_MS = 5_000;
 
 export function createHttpRequestHandler(config: HttpConfig, options: HttpServerOptions = {}): RequestListener {
-  const createMcpServer = options.createMcpServer ?? (() => createExampleMcpServer());
+  const createMcpServer = options.createMcpServer ?? (() => createWooCommerceMcpServer());
   const log = options.log ?? ((line: string) => console.error(line));
   const failureLimit = config.authFailureLimit ?? DEFAULT_AUTH_FAILURE_LIMIT;
   const limiter = failureLimit > 0

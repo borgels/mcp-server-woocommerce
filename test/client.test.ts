@@ -1,8 +1,9 @@
 import { createServer as createHttpServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { API_KEY_HEADER, ExampleClient } from '../src/example/client.js';
-import { ExampleHttpError, parseRetryAfterMs, redactSecrets, SecretRedactor } from '../src/errors.js';
+import { API_KEY_HEADER, WooCommerceClient } from '../src/woocommerce/client.js';
+import { isPublicAddress, pinnedLookup } from '../src/woocommerce/network.js';
+import { WooCommerceHttpError, parseRetryAfterMs, redactSecrets, SecretRedactor } from '../src/errors.js';
 import { USER_AGENT } from '../src/version.js';
 
 const originalEnv = { ...process.env };
@@ -11,7 +12,9 @@ afterEach(() => {
   process.env = { ...originalEnv };
 });
 
-const BASE = 'https://api.vendor.test/v1';
+const SHOP = 'https://shop.example.com';
+const SECRET = 'cs_test_secret';
+const BASE = `${SHOP}/wp-json/wc/v3`;
 
 type Handler = (url: string, init?: RequestInit) => Response | unknown | Promise<Response | unknown>;
 
@@ -41,53 +44,95 @@ function headersOf(init?: RequestInit): Record<string, string> {
 
 const noSleep = vi.fn(async (_ms: number) => undefined);
 
-function makeClient(fetchImpl: typeof fetch, extra: Partial<ConstructorParameters<typeof ExampleClient>[0]> = {}) {
-  return new ExampleClient({ apiKey: 'k', baseUrl: BASE, fetchImpl, sleep: noSleep, ...extra });
+function makeClient(fetchImpl: typeof fetch, extra: Partial<ConstructorParameters<typeof WooCommerceClient>[0]> = {}) {
+  return new WooCommerceClient({ consumerKey: 'k', consumerSecret: SECRET, shopUrl: SHOP, fetchImpl, sleep: noSleep, ...extra });
 }
 
-describe('ExampleClient', () => {
-  it('sends the API key and User-Agent headers and never follows redirects', async () => {
+describe('WooCommerceClient', () => {
+  it('sends Basic auth with key and secret and the User-Agent, below the documented API path, and never follows redirects', async () => {
     let seenUrl = '';
     let seenInit: RequestInit | undefined;
     const fetchImpl = makeFetch((url, init) => {
       seenUrl = url;
       seenInit = init;
-      return { id: '1' };
+      return { id: 1 };
     });
 
-    await new ExampleClient({ apiKey: 'secret-key', baseUrl: `${BASE}/`, fetchImpl }).get('/items/1', { q: 'x' });
+    await new WooCommerceClient({ consumerKey: 'ck_key', consumerSecret: 'cs_secret', shopUrl: `${SHOP}/`, fetchImpl }).get('/customers/1', {
+      q: 'x',
+    });
 
-    expect(seenUrl).toBe(`${BASE}/items/1?q=x`);
-    expect(headersOf(seenInit)[API_KEY_HEADER]).toBe('secret-key');
+    expect(seenUrl).toBe(`${SHOP}/wp-json/wc/v3/customers/1?q=x`);
+    expect(headersOf(seenInit)[API_KEY_HEADER]).toBe(`Basic ${Buffer.from('ck_key:cs_secret').toString('base64')}`);
     expect(headersOf(seenInit)['User-Agent']).toBe(USER_AGENT);
     expect(seenInit?.redirect).toBe('manual');
   });
 
-  it('throws before sending anything when the API key or base URL is missing', async () => {
-    const fetchImpl = makeFetch(() => ({}));
-    delete process.env.EXAMPLE_API_KEY;
-    delete process.env.EXAMPLE_BASE_URL;
+  it('keeps a shop in a subfolder', async () => {
+    const client = new WooCommerceClient({ consumerKey: 'k', consumerSecret: 's', shopUrl: `${SHOP}/butik`, fetchImpl: makeFetch(() => ({})) });
+    expect(client.baseUrl).toBe(`${SHOP}/butik/wp-json/wc/v3`);
+  });
 
-    await expect(new ExampleClient({ baseUrl: BASE, fetchImpl }).get('/x')).rejects.toThrow('EXAMPLE_API_KEY');
-    await expect(new ExampleClient({ apiKey: 'k', fetchImpl }).get('/x')).rejects.toThrow('EXAMPLE_BASE_URL');
+  it('throws before sending anything when the key, the secret or the shop address is missing', async () => {
+    const fetchImpl = makeFetch(() => ({}));
+    delete process.env.WOOCOMMERCE_CONSUMER_KEY;
+    delete process.env.WOOCOMMERCE_CONSUMER_SECRET;
+    delete process.env.WOOCOMMERCE_SHOP_URL;
+
+    await expect(new WooCommerceClient({ consumerSecret: 's', shopUrl: SHOP, fetchImpl }).get('/x')).rejects.toThrow('WOOCOMMERCE_CONSUMER_KEY');
+    await expect(new WooCommerceClient({ consumerKey: 'k', shopUrl: SHOP, fetchImpl }).get('/x')).rejects.toThrow('WOOCOMMERCE_CONSUMER_SECRET');
+    await expect(new WooCommerceClient({ consumerKey: 'k', consumerSecret: 's', fetchImpl }).get('/x')).rejects.toThrow('WOOCOMMERCE_SHOP_URL');
     expect(fetchImpl).not.toHaveBeenCalled();
   });
 
-  it('refuses unsafe base URLs without echoing credentials', () => {
-    expect(() => new ExampleClient({ apiKey: 'k', baseUrl: 'http://api.vendor.test' })).toThrow('https://');
-    expect(() => new ExampleClient({ apiKey: 'k', baseUrl: 'not a url' })).toThrow('not a valid URL');
-    expect(() => new ExampleClient({ apiKey: 'k', baseUrl: 'http://127.0.0.1:8080/api' })).not.toThrow();
-    expect(() => new ExampleClient({ apiKey: 'k', baseUrl: 'http://localhost:8080/api' })).not.toThrow();
-    expect(() => new ExampleClient({ apiKey: 'k', baseUrl: 'http://[::1]:8080/api' })).not.toThrow();
+  it('redacts the key, the secret and their Basic form', () => {
+    const client = new WooCommerceClient({ consumerKey: 'ck_abcdefghijklmnop', consumerSecret: 'cs_qrstuvwxyz012345', shopUrl: SHOP }); // gitleaks:allow (a test value, not a key)
+    const basic = Buffer.from('ck_abcdefghijklmnop:cs_qrstuvwxyz012345').toString('base64');
+    const text = client.redactor.redact(`a ck_abcdefghijklmnop b cs_qrstuvwxyz012345 c ${basic}`);
+    expect(text).not.toContain('ck_abcdefghijklmnop');
+    expect(text).not.toContain('cs_qrstuvwxyz012345');
+    expect(text).not.toContain(basic);
+  });
 
-    for (const baseUrl of [
-      'https://user:hunter2@api.vendor.test/v1',
-      'https://api.vendor.test/v1?x=1',
-      'https://api.vendor.test/v1#frag',
+  it('sends only the writes on its fixed list, and never a DELETE', async () => {
+    const fetchImpl = makeFetch(() => jsonResponse({ id: 1 }, 200));
+    const client = makeClient(fetchImpl);
+    await expect(client.post('/orders', {})).rejects.toThrow('Refused');
+    await expect(client.post('/orders/1/refunds/2', {})).rejects.toThrow('Refused');
+    await expect(client.post('/orders/batch', {})).rejects.toThrow('Refused');
+    await expect(client.post('/coupons', {})).rejects.toThrow('Refused');
+    await expect(client.put('/settings/general/x', {})).rejects.toThrow('Refused');
+    await expect(client.post('/customers', {})).rejects.toThrow('Refused');
+    await expect(client.post('/payment_gateways/x', {})).rejects.toThrow('Refused');
+    await expect(client.put('/orders/abc', {})).rejects.toThrow('Refused');
+    expect(fetchImpl).not.toHaveBeenCalled();
+    await expect(client.post('/orders/1/notes', {})).resolves.toEqual({ id: 1 });
+    await expect(client.put('/customers/21', {})).resolves.toEqual({ id: 1 });
+    expect('delete' in client).toBe(false);
+  });
+
+  it('refuses unsafe shop addresses without echoing credentials', () => {
+    delete process.env.WOOCOMMERCE_ALLOW_PRIVATE_HOST;
+    const make = (shopUrl: string) => () => new WooCommerceClient({ consumerKey: 'k', consumerSecret: 's', shopUrl });
+    expect(make('http://shop.example.com')).toThrow('https://');
+    expect(make('not a url')).toThrow('not a valid URL');
+    for (const shopUrl of [
+      'https://127.0.0.1',
+      'https://10.1.2.3/shop',
+      'https://[::1]',
+      'https://localhost',
+      'https://intranet',
+      'https://shop.local',
+      'https://shop.internal',
     ]) {
+      expect(make(shopUrl), shopUrl).toThrow('public host name');
+    }
+    expect(make(SHOP)).not.toThrow();
+
+    for (const shopUrl of ['https://user:hunter2@shop.example.com', `${SHOP}?x=1`, `${SHOP}#frag`]) {
       let message = '';
       try {
-        new ExampleClient({ apiKey: 'k', baseUrl });
+        make(shopUrl)();
       } catch (error) {
         message = (error as Error).message;
       }
@@ -96,25 +141,134 @@ describe('ExampleClient', () => {
     }
   });
 
-  it('validates numeric environment variables and options instead of producing NaN', () => {
-    process.env.EXAMPLE_TIMEOUT_MS = '30s';
-    expect(() => new ExampleClient({ apiKey: 'k' })).toThrow('EXAMPLE_TIMEOUT_MS');
-    process.env.EXAMPLE_TIMEOUT_MS = '3000000000';
-    expect(() => new ExampleClient({ apiKey: 'k' })).toThrow('EXAMPLE_TIMEOUT_MS');
-    delete process.env.EXAMPLE_TIMEOUT_MS;
-    process.env.EXAMPLE_MAX_CONCURRENCY = 'many';
-    expect(() => new ExampleClient({ apiKey: 'k' })).toThrow('EXAMPLE_MAX_CONCURRENCY');
-    delete process.env.EXAMPLE_MAX_CONCURRENCY;
-    process.env.EXAMPLE_MAX_RESPONSE_BYTES = '10MB';
-    expect(() => new ExampleClient({ apiKey: 'k' })).toThrow('EXAMPLE_MAX_RESPONSE_BYTES');
-    delete process.env.EXAMPLE_MAX_RESPONSE_BYTES;
-    process.env.EXAMPLE_ALLOW_CUSTOM_BASE_URL = 'perhaps';
-    expect(() => new ExampleClient({ apiKey: 'k', baseUrl: BASE })).toThrow('EXAMPLE_ALLOW_CUSTOM_BASE_URL');
+  it('allows a loopback shop only with allowPrivateHost, for local development', () => {
+    const make = (shopUrl: string, allowPrivateHost?: boolean) => () =>
+      new WooCommerceClient({ consumerKey: 'k', consumerSecret: 's', shopUrl, allowPrivateHost });
+    expect(make('http://127.0.0.1:8080')).toThrow();
+    expect(make('http://127.0.0.1:8080', true)).not.toThrow();
+    expect(make('http://localhost:8080', true)).not.toThrow();
+    expect(make('http://shop.example.com', true)).toThrow('https://');
+  });
 
-    expect(() => new ExampleClient({ apiKey: 'k', maxConcurrency: 0 })).toThrow('maxConcurrency');
-    expect(() => new ExampleClient({ apiKey: 'k', maxConcurrency: Number.NaN })).toThrow('maxConcurrency');
-    expect(() => new ExampleClient({ apiKey: 'k', timeoutMs: 2 ** 31 })).toThrow('timeoutMs');
-    expect(() => new ExampleClient({ apiKey: 'k', maxAttempts: 0 })).toThrow('maxAttempts');
+  it('connects only to public addresses, checked by the connection itself, in every spelling', async () => {
+    const PUBLIC = '1.1.1.1'; // hygiene:allow (a well-known public resolver address, used as "a public address")
+    for (const addresses of [
+      ['10.0.0.5'],
+      [PUBLIC, '192.168.1.1'],
+      ['::1'],
+      ['0:0:0:0:0:0:0:1'],
+      ['::ffff:7f00:1'],
+      ['::ffff:127.0.0.1'],
+      ['64:ff9b::a00:1'],
+      ['2002:7f00:1::'],
+      ['fd00::1'],
+      ['fe80::1'],
+      ['169.254.169.254'],
+      ['100.64.0.1'],
+      ['0.0.0.0'],
+      [],
+    ]) {
+      const resolved: string[] = [];
+      const client = new WooCommerceClient({
+        consumerKey: 'k',
+        consumerSecret: 's',
+        shopUrl: SHOP,
+        maxAttempts: 1,
+        resolveHost: async hostname => {
+          resolved.push(hostname);
+          return addresses;
+        },
+      });
+      await expect(client.get('/orders'), addresses.join()).rejects.toThrow('private or local network address');
+      // The name was resolved by the connection; the address used would have been the one checked.
+      expect(resolved, addresses.join()).toEqual(['shop.example.com']);
+    }
+    const failing = new WooCommerceClient({
+      consumerKey: 'k',
+      consumerSecret: 's',
+      shopUrl: SHOP,
+      maxAttempts: 1,
+      resolveHost: async () => {
+        throw new Error('ENOTFOUND');
+      },
+    });
+    await expect(failing.get('/orders')).rejects.toThrow(/Network error calling the WooCommerce API \(GET\) \(ENOTFOUND\)/);
+  });
+
+  it('checks the address for every new connection, so a changed DNS answer is checked again', async () => {
+    const PUBLIC = '1.1.1.1'; // hygiene:allow (a well-known public resolver address, used as "a public address")
+    const answers = [[PUBLIC], ['127.0.0.1']];
+    const lookup = pinnedLookup(async () => answers.shift() ?? []);
+    const run = () =>
+      new Promise<{ error: unknown; address: unknown }>(resolve =>
+        lookup('shop.example.com', { all: true }, (error, address) => resolve({ error, address })),
+      );
+    expect(await run()).toEqual({ error: null, address: [{ address: PUBLIC, family: 4 }] });
+    const second = await run();
+    expect((second.error as { code?: string }).code).toBe('ERR_SHOP_PRIVATE_ADDRESS');
+  });
+
+  it('classifies addresses by their value, not their spelling', () => {
+    const PUBLIC = '1.1.1.1'; // hygiene:allow (a well-known public resolver address, used as "a public address")
+    expect(isPublicAddress(PUBLIC)).toBe(true);
+    expect(isPublicAddress(`::ffff:${PUBLIC}`)).toBe(true);
+    for (const address of [
+      '127.0.0.1',
+      '0:0:0:0:0:0:0:1',
+      '::1',
+      '::ffff:7f00:1',
+      '::ffff:127.0.0.1',
+      '::127.0.0.1',
+      '64:ff9b::7f00:1',
+      '2002:a00:1::1',
+      '[::1]',
+      'fe80::1%eth0',
+      '203.0.113.10',
+      '224.0.0.1',
+      'not an address',
+    ]) {
+      expect(isPublicAddress(address), address).toBe(false);
+    }
+  });
+
+  it('gives the same shop identity for every key of a shop, and holds no credential', () => {
+    const a = new WooCommerceClient({ consumerKey: 'ck_one_000000000', consumerSecret: 'cs_one', shopUrl: SHOP });
+    const b = new WooCommerceClient({ consumerKey: 'ck_two_000000000', consumerSecret: 'cs_two', shopUrl: 'https://WWW.Shop.Example.com/' });
+    const other = new WooCommerceClient({ consumerKey: 'ck_one_000000000', consumerSecret: 'cs_one', shopUrl: 'https://other.example.com' });
+    expect(a.shopIdentity()).toBe(b.shopIdentity());
+    expect(a.shopIdentity()).not.toBe(other.shopIdentity());
+    expect(a.shopIdentity()).not.toContain('ck_one');
+  });
+
+  it('reads the list totals from X-WP-Total and X-WP-TotalPages', async () => {
+    const fetchImpl = makeFetch(() => jsonResponse([{ id: 1 }], 200, { 'X-WP-Total': '42', 'X-WP-TotalPages': '3' }));
+    await expect(makeClient(fetchImpl).getPage('/orders')).resolves.toEqual({ body: [{ id: 1 }], total: 42, totalPages: 3 });
+    const odd = makeFetch(() => jsonResponse([], 200, { 'X-WP-Total': 'many' }));
+    await expect(makeClient(odd).getPage('/orders')).resolves.toEqual({ body: [], total: undefined, totalPages: undefined });
+  });
+
+  it('validates numeric environment variables and options instead of producing NaN', () => {
+    const make = (extra: Partial<ConstructorParameters<typeof WooCommerceClient>[0]> = {}) => () =>
+      new WooCommerceClient({ consumerKey: 'k', consumerSecret: 's', shopUrl: SHOP, ...extra });
+    process.env.WOOCOMMERCE_TIMEOUT_MS = '30s';
+    expect(make()).toThrow('WOOCOMMERCE_TIMEOUT_MS');
+    process.env.WOOCOMMERCE_TIMEOUT_MS = '3000000000';
+    expect(make()).toThrow('WOOCOMMERCE_TIMEOUT_MS');
+    delete process.env.WOOCOMMERCE_TIMEOUT_MS;
+    process.env.WOOCOMMERCE_MAX_CONCURRENCY = 'many';
+    expect(make()).toThrow('WOOCOMMERCE_MAX_CONCURRENCY');
+    delete process.env.WOOCOMMERCE_MAX_CONCURRENCY;
+    process.env.WOOCOMMERCE_MAX_RESPONSE_BYTES = '10MB';
+    expect(make()).toThrow('WOOCOMMERCE_MAX_RESPONSE_BYTES');
+    delete process.env.WOOCOMMERCE_MAX_RESPONSE_BYTES;
+    process.env.WOOCOMMERCE_ALLOW_PRIVATE_HOST = 'perhaps';
+    expect(make()).toThrow('WOOCOMMERCE_ALLOW_PRIVATE_HOST');
+    delete process.env.WOOCOMMERCE_ALLOW_PRIVATE_HOST;
+
+    expect(make({ maxConcurrency: 0 })).toThrow('maxConcurrency');
+    expect(make({ maxConcurrency: Number.NaN })).toThrow('maxConcurrency');
+    expect(make({ timeoutMs: 2 ** 31 })).toThrow('timeoutMs');
+    expect(make({ maxAttempts: 0 })).toThrow('maxAttempts');
   });
 });
 
@@ -123,10 +277,10 @@ describe('error handling', () => {
     const fetchImpl = makeFetch(() => jsonResponse({ code: 'invalid_key', message: 'Unrecognized key' }, 401));
     const error = await makeClient(fetchImpl).get('/x').catch((e: unknown) => e);
 
-    expect(error).toBeInstanceOf(ExampleHttpError);
-    expect((error as ExampleHttpError).status).toBe(401);
+    expect(error).toBeInstanceOf(WooCommerceHttpError);
+    expect((error as WooCommerceHttpError).status).toBe(401);
     expect((error as Error).message).toContain('HTTP 401');
-    expect((error as Error).message).toContain('EXAMPLE_API_KEY');
+    expect((error as Error).message).toContain('Settings -> Advanced -> REST API');
     expect((error as Error).message).not.toContain('Unrecognized key');
     expect((error as Error).message).not.toContain('invalid_key');
   });
@@ -136,8 +290,8 @@ describe('error handling', () => {
     const fetchImpl = makeFetch(() => new Response(html, { status: 502, headers: { 'content-type': 'text/html' } }));
     const error = (await makeClient(fetchImpl, { maxAttempts: 1 })
       .get('/x')
-      .catch((e: unknown) => e)) as ExampleHttpError;
-    expect(error.message).toBe('Example API request failed with HTTP 502');
+      .catch((e: unknown) => e)) as WooCommerceHttpError;
+    expect(error.message).toBe('WooCommerce API request failed with HTTP 502');
   });
 
   it('reads at most 64 KB of an error body', async () => {
@@ -156,40 +310,41 @@ describe('error handling', () => {
     );
     const error = (await makeClient(fetchImpl)
       .get('/x')
-      .catch((e: unknown) => e)) as ExampleHttpError;
-    expect(error).toBeInstanceOf(ExampleHttpError);
+      .catch((e: unknown) => e)) as WooCommerceHttpError;
+    expect(error).toBeInstanceOf(WooCommerceHttpError);
     expect(pulled).toBeLessThan(10);
     expect(error.message.length).toBeLessThan(700);
   });
 
-  it('redacts the configured API key wherever it appears, before truncating', async () => {
-    const apiKey = 'live-key-0123456789abcdef';
+  it('redacts the configured access token wherever it appears, before truncating', async () => {
+    const accessToken = 'live-key-0123456789abcdef'; // gitleaks:allow (a test value, not a key)
     const respond = (body: string, type = 'text/plain') =>
-      new ExampleClient({
-        apiKey,
-        baseUrl: BASE,
+      new WooCommerceClient({
+        consumerKey: accessToken,
+        consumerSecret: SECRET,
+        shopUrl: SHOP,
         fetchImpl: makeFetch(() => new Response(body, { status: 400, headers: { 'content-type': type } })),
       });
 
-    const echoed = (await respond(`proxy error: ${apiKey} and ${encodeURIComponent(apiKey)}`)
+    const echoed = (await respond(`proxy error: ${accessToken} and ${encodeURIComponent(accessToken)}`)
       .get('/x')
-      .catch((e: unknown) => e)) as ExampleHttpError;
-    expect(echoed.message).not.toContain(apiKey);
+      .catch((e: unknown) => e)) as WooCommerceHttpError;
+    expect(echoed.message).not.toContain(accessToken);
     expect(echoed.message).not.toContain('proxy error');
 
-    const boundary = (await respond(`${'x'.repeat(490)}${apiKey}`)
+    const boundary = (await respond(`${'x'.repeat(490)}${accessToken}`)
       .get('/x')
-      .catch((e: unknown) => e)) as ExampleHttpError;
-    expect(boundary.message).not.toContain(apiKey.slice(0, 6));
+      .catch((e: unknown) => e)) as WooCommerceHttpError;
+    expect(boundary.message).not.toContain(accessToken.slice(0, 6));
 
-    const nested = (await respond(JSON.stringify({ message: 'bad', nested: { echo: apiKey } }), 'application/json')
+    const nested = (await respond(JSON.stringify({ message: 'bad', nested: { echo: accessToken } }), 'application/json')
       .get('/x')
-      .catch((e: unknown) => e)) as ExampleHttpError;
-    expect(JSON.stringify(nested)).not.toContain(apiKey);
+      .catch((e: unknown) => e)) as WooCommerceHttpError;
+    expect(JSON.stringify(nested)).not.toContain(accessToken);
 
     expect(redactSecrets('X-API-KEY: abc123')).not.toContain('abc123');
     expect(redactSecrets('Authorization: Bearer abc123')).not.toContain('abc123');
-    expect(redactSecrets('EXAMPLE_API_KEY=abc123')).not.toContain('abc123');
+    expect(redactSecrets('WOOCOMMERCE_CONSUMER_SECRET=abc123')).not.toContain('abc123');
   });
 
   it('redacts the configured key header by name', () => {
@@ -218,9 +373,9 @@ describe('error handling', () => {
   it('keeps query strings out of error URLs', async () => {
     const fetchImpl = makeFetch(() => jsonResponse({}, 400));
     const error = (await makeClient(fetchImpl)
-      .get('/items', { cursor: 'secret-cursor' })
-      .catch((e: unknown) => e)) as ExampleHttpError;
-    expect(error.url).toBe(`${BASE}/items`);
+      .get('/customers', { cursor: 'secret-cursor' })
+      .catch((e: unknown) => e)) as WooCommerceHttpError;
+    expect(error.url).toBe(`${BASE}/customers`);
     expect(error.message).not.toContain('secret-cursor');
   });
 
@@ -243,7 +398,7 @@ describe('error handling', () => {
     const message = await makeClient(fetchImpl, { maxAttempts: 1 })
       .get('/x')
       .catch((e: Error) => e.message);
-    expect(message).toMatch(/Network error calling the Example API \(GET\) \(ENOTFOUND\)\./);
+    expect(message).toMatch(/Network error calling the WooCommerce API \(GET\) \(ENOTFOUND\)\./);
     expect(message).not.toMatch(/odd|getaddrinfo/);
   });
 
@@ -279,13 +434,13 @@ describe('redirects', () => {
       () => new Response(null, { status: 302, headers: { location: 'https://other.vendor.test/v1/items?t=1' } }),
     );
     const message = await makeClient(fetchImpl)
-      .get('/items')
+      .get('/customers')
       .catch((e: Error) => e.message);
     expect(message).toContain('redirect (HTTP 302) for GET');
-    expect(message).toContain('EXAMPLE_BASE_URL');
+    expect(message).toContain('WOOCOMMERCE_SHOP_URL');
     // The Location is the vendor's text: never quoted.
     expect(message).not.toContain('other.vendor.test');
-    await expect(makeClient(fetchImpl).post('/items', {})).rejects.toThrow(/redirect/);
+    await expect(makeClient(fetchImpl).post('/orders/1/notes', {})).rejects.toThrow(/redirect/);
     expect(fetchImpl).toHaveBeenCalledTimes(2);
     expect(fetchImpl.mock.calls.every(([url]) => !String(url).includes('other.vendor.test'))).toBe(true);
   });
@@ -318,9 +473,9 @@ describe('retries and concurrency', () => {
     const sleep = vi.fn(async (_ms: number) => undefined);
     const error = (await makeClient(fetchImpl, { sleep })
       .get('/x')
-      .catch((e: unknown) => e)) as ExampleHttpError;
+      .catch((e: unknown) => e)) as WooCommerceHttpError;
 
-    expect(error).toBeInstanceOf(ExampleHttpError);
+    expect(error).toBeInstanceOf(WooCommerceHttpError);
     expect(error.message).toContain('retry-after=3600s');
     expect(fetchImpl).toHaveBeenCalledTimes(1);
     expect(sleep).not.toHaveBeenCalled();
@@ -345,17 +500,17 @@ describe('retries and concurrency', () => {
     expect(permanent).toHaveBeenCalledTimes(1);
   });
 
-  it('never retries POST or PATCH', async () => {
+  it('never retries POST or PUT', async () => {
     const fetchImpl = makeFetch(() => jsonResponse({}, 503));
     const client = makeClient(fetchImpl);
-    await expect(client.post('/x', {})).rejects.toBeInstanceOf(ExampleHttpError);
-    await expect(client.patch('/x', {})).rejects.toBeInstanceOf(ExampleHttpError);
+    await expect(client.post('/orders/1/notes', {})).rejects.toBeInstanceOf(WooCommerceHttpError);
+    await expect(client.put('/customers/21', {})).rejects.toBeInstanceOf(WooCommerceHttpError);
     expect(fetchImpl).toHaveBeenCalledTimes(2);
 
     const failing = makeFetch(() => {
       throw new TypeError('fetch failed', { cause: Object.assign(new Error('reset'), { code: 'ECONNRESET' }) });
     });
-    await expect(makeClient(failing).post('/x', {})).rejects.toThrow('Network error');
+    await expect(makeClient(failing).post('/orders/1/notes', {})).rejects.toThrow('Network error');
     expect(failing).toHaveBeenCalledTimes(1);
   });
 
@@ -373,7 +528,7 @@ describe('retries and concurrency', () => {
     });
     const client = makeClient(fetchImpl, { maxConcurrency: 1 });
     await expect(client.get('/x')).rejects.toThrow('timed out');
-    await expect(client.get('/x')).rejects.toBeInstanceOf(ExampleHttpError);
+    await expect(client.get('/x')).rejects.toBeInstanceOf(WooCommerceHttpError);
     await expect(client.get('/x')).resolves.toEqual({ ok: true });
   });
 
@@ -403,29 +558,31 @@ describe('against a local upstream (real sockets)', () => {
     upstream = undefined;
   });
 
+  /** A local shop; the client is given its address with allowPrivateHost, and talks to `${shop}/wp-json/wc/v3`. */
   async function startUpstream(handler: Parameters<typeof createHttpServer>[1]): Promise<string> {
     upstream = createHttpServer(handler);
     await new Promise<void>(resolve => upstream?.listen(0, '127.0.0.1', resolve));
-    return `http://127.0.0.1:${(upstream.address() as AddressInfo).port}/v1`;
+    return `http://127.0.0.1:${(upstream.address() as AddressInfo).port}`;
   }
 
   it('sends the key, refuses a redirect and does not contact the redirect target', async () => {
     const seen: Array<{ url?: string; key?: string }> = [];
     const base = await startUpstream((req, res) => {
       seen.push({ url: req.url, key: req.headers[API_KEY_HEADER.toLowerCase()] as string | undefined });
-      if (req.url === '/v1/items/1') {
-        res.writeHead(200, { 'content-type': 'application/json' }).end('{"id":"1"}');
+      if (req.url === '/wp-json/wc/v3/customers/1') {
+        res.writeHead(200, { 'content-type': 'application/json' }).end('{"id":1}');
         return;
       }
-      res.writeHead(302, { location: `${base}/items/1` }).end();
+      res.writeHead(302, { location: `${base}/wp-json/wc/v3/customers/1` }).end();
     });
-    const client = new ExampleClient({ apiKey: 'local-key-123456', baseUrl: base });
+    const client = new WooCommerceClient({ consumerKey: 'local-key-123456', consumerSecret: 'local-secret', shopUrl: base, allowPrivateHost: true });
+    const basic = `Basic ${Buffer.from('local-key-123456:local-secret').toString('base64')}`;
 
-    await expect(client.get('/items/1')).resolves.toEqual({ id: '1' });
+    await expect(client.get('/customers/1')).resolves.toEqual({ id: 1 });
     await expect(client.get('/moved')).rejects.toThrow('redirects are not followed');
     expect(seen).toEqual([
-      { url: '/v1/items/1', key: 'local-key-123456' },
-      { url: '/v1/moved', key: 'local-key-123456' },
+      { url: '/wp-json/wc/v3/customers/1', key: basic },
+      { url: '/wp-json/wc/v3/moved', key: basic },
     ]);
   });
 
@@ -433,7 +590,7 @@ describe('against a local upstream (real sockets)', () => {
     const base = await startUpstream(() => {
       // never answers
     });
-    const client = new ExampleClient({ apiKey: 'k', baseUrl: base, timeoutMs: 100, maxAttempts: 1 });
+    const client = new WooCommerceClient({ consumerKey: 'k', consumerSecret: 's', shopUrl: base, allowPrivateHost: true, timeoutMs: 100, maxAttempts: 1 });
     await expect(client.get('/slow')).rejects.toThrow(/timed out after 100 ms/);
     upstream?.closeAllConnections();
   });

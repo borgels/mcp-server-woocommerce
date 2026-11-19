@@ -1,50 +1,71 @@
 import { z } from 'zod/v4';
-import { UNTRUSTED_CONTENT_NOTE } from './example/annotations.js';
-import { ExampleClient, type ExampleClientOptions } from './example/client.js';
+import { UNTRUSTED_CONTENT_NOTE } from './woocommerce/annotations.js';
+import { WooCommerceClient, type WooCommerceClientOptions } from './woocommerce/client.js';
 import {
   isToolDisabled,
   resolveInstancePolicy,
   runInCallScope,
   TOOL_PREFIX,
   type InstancePolicy,
-} from './example/policy.js';
+} from './woocommerce/policy.js';
 import { ConfigError } from './config-env.js';
 import { formatUnknownError, redactDeep, SecretRedactor } from './errors.js';
 import { fixedOutputs, withheldResult } from './fallbacks.js';
 import { admitsKey, keyRefusedText, leaksSecret, sealedError } from './key-admission.js';
 import {
   auditRejectedCall,
-  EXAMPLE_TOOLS,
+  WOOCOMMERCE_TOOLS,
   executeTool,
   findTool,
+  logFieldValue,
+  validateCall,
   validateStartupConfig,
+  type WooCommerceChangeAction,
+  type WooCommerceChangeRecord,
+  type WooCommerceChangeSpec,
   type CallContext,
   type ToolDefinition,
   type UpstreamOperation,
-} from './tools/example.js';
+} from './tools/woocommerce.js';
 
 /**
  * Embeddable entry point (package export `./gateway`): an embedding host,
  * such as an MCP gateway that does its own per-user authorization, lists
  * `tools` and invokes `callTool`. Tool definitions, input validation,
  * instance policy and audit are shared with the MCP server in
- * src/tools/example.ts.
+ * src/tools/woocommerce.ts.
  *
- * Several gateway instances (for example one per tenant) can run in one
- * process. Each instance uses only the credentials passed to
- * createExampleGateway (never EXAMPLE_API_KEY or EXAMPLE_BASE_URL from the
- * environment) and redacts errors with its own secrets only.
+ * One instance per shop. Several instances can run in one process: each
+ * uses only the consumer key, secret and shop address passed to
+ * createWooCommerceGateway (never WOOCOMMERCE_CONSUMER_KEY,
+ * WOOCOMMERCE_CONSUMER_SECRET or WOOCOMMERCE_SHOP_URL from the environment),
+ * and redacts with its own secrets only. A gateway never sends to a shop
+ * address that is not https on a public host name, or whose name resolves to
+ * a private address.
  *
  * Instance policy (writes, disabled tools, audit) comes from the host when it
- * passes `policy`: that instance then reads none of EXAMPLE_ENABLE_WRITES,
- * EXAMPLE_DISABLED_TOOLS, EXAMPLE_AUDIT_LOG or EXAMPLE_ALLOW_CUSTOM_BASE_URL,
+ * passes `policy`: that instance then reads none of WOOCOMMERCE_ENABLE_WRITES,
+ * WOOCOMMERCE_DISABLED_TOOLS, WOOCOMMERCE_AUDIT_LOG or WOOCOMMERCE_ALLOW_PRIVATE_HOST,
  * so two tenants in one process can have different settings. Without
  * `policy` the instance uses the environment, as the MCP server does. Limits
  * (timeouts, retries) are still read from the environment and apply to every
  * instance.
+ *
+ * What no policy can turn on: a request outside the client's fixed list of
+ * writes (src/woocommerce/client.ts, ALLOWED_WRITES). There is no DELETE, no
+ * refund through a payment gateway (a refund is recorded with api_refund
+ * false), no batch endpoint, and no tool that changes settings, users,
+ * coupons or payment methods.
  */
 
-export type { AuditSink, InstancePolicy } from './example/policy.js';
+export type { AuditSink, InstancePolicy } from './woocommerce/policy.js';
+export type {
+  WooCommerceChangeAction,
+  WooCommerceChangeRecord,
+  WooCommerceChangeSpec,
+  WooCommerceLogField,
+  WooCommerceLogFieldType,
+} from './tools/woocommerce.js';
 
 export type GatewayRiskLevel = 'read' | 'write' | 'destructive';
 export type GatewayJsonValue = string | number | boolean | null | GatewayJsonValue[] | { [key: string]: GatewayJsonValue };
@@ -95,17 +116,38 @@ export interface GatewayToolCatalogEntry {
    * (`broad`), false unless a tool declares it.
    */
   readonly broad: boolean;
+  /**
+   * True for a tool a person should confirm outside the chat before it runs:
+   * recording a refund (it records a refund in the shop; no money moves).
+   */
+  readonly requiresConfirmation: boolean;
+  /**
+   * Write tools only: what the change does, for a host that logs a change
+   * before it is sent. `logFields` are the input fields that identify it,
+   * each with the one type its value must have (record ids, amounts,
+   * currency codes, dates, counts, flags and kinds in clear; numbers the
+   * company chose only as pseudonyms; never names or free text).
+   * `resolveWooCommerceChange` returns their values.
+   */
+  readonly change?: WooCommerceChangeSpec;
 }
 
-export interface ExampleGatewayOptions extends Omit<ExampleClientOptions, 'apiKey' | 'baseUrl' | 'credentialEnv'> {
-  /** API key of this instance. Required; never read from the environment. */
-  apiKey: string;
-  /** API base URL of this instance. Required; never read from the environment. */
-  baseUrl: string;
+export interface WooCommerceGatewayOptions
+  extends Omit<WooCommerceClientOptions, 'consumerKey' | 'consumerSecret' | 'shopUrl' | 'credentialEnv' | 'allowPrivateHost'> {
+  /** REST API consumer key (ck_...) of this shop. Required; never read from the environment. */
+  consumerKey: string;
+  /** REST API consumer secret (cs_...) of this shop. Required; never read from the environment. */
+  consumerSecret: string;
   /**
-   * Instance policy from the host. When given, the instance reads no policy
-   * or audit variables from the environment (see InstancePolicy). A host
-   * serving several tenants should always pass it.
+   * The shop's address, e.g. https://shop.example.dk. Required; never read
+   * from the environment. Must be https and a public host name; a name that
+   * resolves to a private address is refused before each request.
+   */
+  shopUrl: string;
+  /**
+   * Instance policy from the host: enableWrites, disabledTools, allowedTools
+   * and audit. When given, the instance reads no policy or audit variables
+   * from the environment. A host serving several shops should always pass it.
    */
   policy?: InstancePolicy;
 }
@@ -152,106 +194,226 @@ function deepFreeze<T>(value: T): T {
 }
 
 /** All tools, as gateway definitions (names without the prefix). */
-export const exampleGatewayTools: GatewayToolDefinition[] = EXAMPLE_TOOLS.map(toGatewayDefinition);
+export const wooCommerceGatewayTools: GatewayToolDefinition[] = WOOCOMMERCE_TOOLS.map(toGatewayDefinition);
 
 /**
  * The tool catalog: every tool with its gateway definition and the upstream
  * requests it may make. Generated from the same tool table as the MCP server
- * and `exampleGatewayTools`, and deeply frozen. Hosts can use it to build
+ * and `wooCommerceGatewayTools`, and deeply frozen. Hosts can use it to build
  * their own permission model without creating a gateway instance.
  */
-export const exampleToolCatalog: readonly GatewayToolCatalogEntry[] = deepFreeze(
-  EXAMPLE_TOOLS.map(tool => ({
+export const wooCommerceToolCatalog: readonly GatewayToolCatalogEntry[] = deepFreeze(
+  WOOCOMMERCE_TOOLS.map(tool => ({
     ...toGatewayDefinition(tool),
     upstream: tool.upstream.map(operation => ({ ...operation })),
     broad: tool.broad === true,
+    requiresConfirmation: tool.requiresConfirmation === true,
+    ...(tool.change
+      ? { change: { ...tool.change, logFields: tool.change.logFields.map(field => ({ ...field })) } }
+      : {}),
   })),
 );
 
-function requiredCredential(options: ExampleGatewayOptions, name: 'apiKey' | 'baseUrl'): string {
-  const value: unknown = (options as Partial<ExampleGatewayOptions> | undefined)?.[name];
+/** What a write tool call will change, resolved from its input before anything is sent. */
+export interface WooCommerceChange {
+  readonly tool: string;
+  readonly action: WooCommerceChangeAction;
+  readonly record: WooCommerceChangeRecord;
+  readonly movesMoney: false;
+  readonly requiresConfirmation: boolean;
+  /**
+   * The values of the tool's `logFields` that are present and have their
+   * field's type. A value of the wrong type is left out, so a name or a free
+   * text can never reach the values.
+   */
+  readonly values: Readonly<Record<string, string | number | boolean>>;
+}
+
+export type WooCommerceChangeResolution =
+  | { readonly ok: true; readonly change: WooCommerceChange }
+  | { readonly ok: false; readonly reason: string };
+
+/**
+ * Resolves what a write tool call will change, for a host that logs the
+ * change before the call runs: the action, the record kind and the values of
+ * the tool's `logFields`. A number the company chose (contact, product or
+ * voucher number) comes back only as a pseudonym: HMAC-SHA-256 with
+ * `options.pseudonymKey` when the host gives one, otherwise SHA-256. Refuses
+ * read tools, unknown tools and invalid input, as callTool does.
+ */
+export function resolveWooCommerceChange(
+  toolName: string,
+  input: GatewayJsonObject = {},
+  options: { pseudonymKey?: string | Uint8Array; redactor?: SecretRedactor } = {},
+): WooCommerceChangeResolution {
+  const name = typeof toolName === 'string' ? toolName.trim() : '';
+  const tool = name ? findTool(`${TOOL_PREFIX}${stripPrefix(name)}`) : undefined;
+  if (!tool) return { ok: false, reason: 'Unsupported WooCommerce gateway tool.' };
+  if (!tool.change) return { ok: false, reason: `${stripPrefix(tool.name)} is not a write tool.` };
+  const valid = validateCall(tool, input);
+  if (!valid.ok) return { ok: false, reason: `Invalid input for ${stripPrefix(tool.name)}.` };
+  const data = valid.data;
+  const values: Record<string, string | number | boolean> = {};
+  for (const field of tool.change.logFields) {
+    const value = logFieldValue(field.type, data[field.name], options.pseudonymKey);
+    if (value === undefined) continue;
+    // A secret put in a field by mistake never reaches the host's log: with an instance's redactor, a value that
+    // holds a piece of its key or secret is left out.
+    if (options.redactor && leaksSecret(String(value), options.redactor)) continue;
+    values[field.name] = value;
+  }
+  return {
+    ok: true,
+    change: Object.freeze({
+      tool: stripPrefix(tool.name),
+      action: tool.change.action,
+      record: tool.change.record,
+      movesMoney: false as const,
+      requiresConfirmation: tool.requiresConfirmation === true,
+      values: Object.freeze(values),
+    }),
+  };
+}
+
+const SECRET_OPTIONS = ['consumerKey', 'consumerSecret'] as const;
+type SecretOption = (typeof SECRET_OPTIONS)[number];
+
+function requiredSecret(options: Partial<WooCommerceGatewayOptions> | undefined, name: SecretOption): string {
+  const value: unknown = options?.[name];
   if (typeof value !== 'string' || value.trim() === '') {
     throw new ConfigError(
-      `createExampleGateway requires options.${name}. Embedded instances do not read credentials from the environment.`,
+      `createWooCommerceGateway requires options.${name}. Embedded instances do not read credentials from the environment.`,
     );
   }
   // Key admission (src/key-admission.ts): printable ASCII of 16 characters or more, sharing no piece with any text of
   // ours. Checked before anything is built from the key; the refusal is a fixed text that holds no piece of it.
-  if (name === 'apiKey' && !admitsKey(value.trim())) {
+  if (!admitsKey(value.trim())) {
     throw new ConfigError(keyRefusedText(value.trim()));
   }
   return value.trim();
 }
 
 /**
- * Create one gateway instance. `apiKey` and `baseUrl` are required and
- * are the only credentials the instance uses; a missing value fails here.
+ * Create one gateway instance for one shop. `consumerKey`,
+ * `consumerSecret` and `shopUrl` are required and are the only credentials
+ * the instance uses; a missing value fails here.
  */
-export function createExampleGateway(options: ExampleGatewayOptions) {
-  let apiKey: string | undefined;
-  let guard: SecretRedactor | undefined;
-  // What the host gave, admitted or not: every error is masked against it.
-  const given: unknown = (options as Partial<ExampleGatewayOptions> | undefined)?.apiKey;
-  const secrets = typeof given === 'string' ? [given, given.trim()] : [];
+export function createWooCommerceGateway(options: WooCommerceGatewayOptions) {
+  const given = options as Partial<WooCommerceGatewayOptions> | undefined;
+  // The host's pseudonym key, in every form it could be written, read before anything else can fail.
+  const pseudonymForms = keyForms(given?.policy?.pseudonymKey);
+  // What the host gave, admitted or not: every error is masked against it, the pseudonym key included.
+  const secrets = [
+    ...SECRET_OPTIONS.flatMap(name => {
+      const value: unknown = given?.[name];
+      return typeof value === 'string' ? [value, value.trim()] : [];
+    }),
+    ...pseudonymForms,
+  ];
+  let guard: SecretRedactor | undefined = new SecretRedactor();
   try {
-    // Admission first, before a redactor is built from the key.
-    apiKey = requiredCredential(options, 'apiKey');
-    guard = new SecretRedactor().addSecret(apiKey);
-    // The fixed outputs of the sink check (src/fallbacks.ts) must hold no piece of the key.
+    // Every secret is known to the guard before any validation that can throw, and inside the try: whatever
+    // happens while registering it leaves as the sealed error below.
+    for (const form of pseudonymForms) guard.addSecret(form);
+    // The pseudonym key is admitted like the shop's key: as text, printable and sharing no piece with any text of
+    // ours, so no fixed text (a fallback, an error, the tool list) can carry a piece of it; as bytes, every form
+    // of it that is printable text (the bytes read as text, hex, base64) the same way.
+    const pseudonymKey: unknown = given?.policy?.pseudonymKey;
+    const refused =
+      typeof pseudonymKey === 'string'
+        ? !admitsKey(pseudonymKey)
+        : pseudonymForms.some(form => /^[ -~]+$/.test(form) && !admitsKey(form));
+    if (refused) throw new ConfigError(PSEUDONYM_KEY_REFUSED);
+    const admitted = Object.fromEntries(SECRET_OPTIONS.map(name => [name, requiredSecret(given, name)])) as Record<
+      SecretOption,
+      string
+    >;
+    for (const name of SECRET_OPTIONS) guard.addSecret(admitted[name]);
+    guard.addSecret(Buffer.from(`${admitted.consumerKey}:${admitted.consumerSecret}`, 'utf8').toString('base64'));
+    // The fixed outputs of the sink check (src/fallbacks.ts) must hold no piece of a key.
     if (leaksSecret(fixedOutputs(), guard)) {
-      throw new ConfigError(keyRefusedText(apiKey));
+      throw new ConfigError(keyRefusedText(''));
     }
-    const gateway = buildGateway(options, apiKey);
+    const gateway = buildGateway(options, admitted);
     // The tool list leaves the gateway as it is: a key that shares a piece with it is refused.
     if (leaksSecret(gateway.tools, guard)) {
-      throw new ConfigError(keyRefusedText(apiKey));
+      throw new ConfigError(keyRefusedText(''));
     }
     return gateway;
   } catch (error) {
     const raw = error instanceof Error ? error.message : String(error);
     let message = raw;
-    if (guard && apiKey !== undefined) {
-      // Redacted, then checked whole as the very last step: a message that still holds a piece of the key becomes
+    if (guard) {
+      // Redacted, then checked whole as the very last step: a message that still holds a piece of a key becomes
       // the fixed refusal.
       message = guard.redact(raw);
-      if (leaksSecret(message, guard)) message = keyRefusedText(apiKey);
+      if (leaksSecret(message, guard)) message = keyRefusedText('');
     }
     // A fresh error in final form (src/key-admission.ts, sealedError): no cause, a stack without frames, and name,
-    // message and stack masked against the key. Then the sink check on the finished object.
+    // message and stack masked against every key given. Then the sink check on the finished object.
     const final = sealedError(error instanceof ConfigError ? new ConfigError(message) : new Error(message), ...secrets);
-    if (guard && apiKey !== undefined && leaksSecret(final, guard)) {
-      throw sealedError(new ConfigError(keyRefusedText(apiKey)), ...secrets);
+    if (guard && leaksSecret(final, guard)) {
+      throw sealedError(new ConfigError(keyRefusedText('')), ...secrets);
     }
     throw final;
   }
 }
 
-function buildGateway(options: ExampleGatewayOptions, apiKey: string) {
-  const baseUrl = requiredCredential(options, 'baseUrl');
-  const { policy: hostPolicy, ...clientOptions } = options;
+const PSEUDONYM_KEY_REFUSED =
+  'policy.pseudonymKey was refused: use at least 32 random printable characters (for example 32 random bytes as hex) or at least 32 random bytes.';
+
+/** A key given as text or bytes, in every form it could be written: as given, or as the bytes read or encoded. */
+function keyForms(key: unknown): string[] {
+  if (typeof key === 'string') return key === '' ? [] : [...new Set([key, key.trim()])];
+  if (key instanceof Uint8Array) {
+    const bytes = Buffer.from(key);
+    return [...new Set(['utf8', 'latin1', 'hex', 'base64', 'base64url'].map(form => bytes.toString(form as BufferEncoding)))];
+  }
+  return [];
+}
+
+/** Register a key given as text or bytes, in every form it could be written. */
+function addKeyMaterial(redactor: SecretRedactor, key: string | Uint8Array): void {
+  for (const form of keyForms(key)) redactor.addSecret(form);
+}
+
+function buildGateway(options: WooCommerceGatewayOptions, secrets: Record<SecretOption, string>) {
+  const { policy: hostPolicy, consumerKey: _key, consumerSecret: _secret, shopUrl, ...clientOptions } = options;
+  if (typeof shopUrl !== 'string' || shopUrl.trim() === '') {
+    throw new ConfigError('createWooCommerceGateway requires options.shopUrl. Embedded instances do not read it from the environment.');
+  }
   const policy =
-    hostPolicy === undefined ? undefined : resolveInstancePolicy(hostPolicy, EXAMPLE_TOOLS.map(tool => tool.name));
+    hostPolicy === undefined ? undefined : resolveInstancePolicy(hostPolicy, WOOCOMMERCE_TOOLS.map(tool => tool.name));
   if (policy === undefined) {
     // In a scope of its own: a gateway created from inside another instance's call (its audit sink or its fetch)
     // validates against the environment, never against that instance's policy.
     runInCallScope({}, () => validateStartupConfig());
   }
-  const client = new ExampleClient({
+  const client = new WooCommerceClient({
     ...clientOptions,
-    apiKey,
-    baseUrl,
+    ...secrets,
+    shopUrl: shopUrl.trim(),
     credentialEnv: {},
-    // Under a host's policy nothing is read from the environment, this switch included.
-    ...(policy ? { allowCustomBaseUrl: clientOptions.allowCustomBaseUrl ?? false } : {}),
+    // A gateway never talks to a private or local address: the switch is not read from the environment here.
+    allowPrivateHost: false,
   });
   const redactor: SecretRedactor = client.redactor;
+  // The host's pseudonym key is a secret like the shop's: kept out of results, logs and errors.
+  if (policy?.pseudonymKey !== undefined) addKeyMaterial(redactor, policy.pseudonymKey);
   // Every call in a scope of its own, with or without a host policy: a call made from inside another
   // instance's call (its audit sink or its fetch) never runs under that instance's policy, sink or redactor.
   const underPolicy = <T>(work: () => T): T => runInCallScope(policy ? { policy, redactor } : { redactor }, work);
 
   return {
-    /** Tools enabled on this instance (the policy's or EXAMPLE_DISABLED_TOOLS' disabled tools are left out). */
-    tools: underPolicy(() => exampleGatewayTools.filter(tool => !isToolDisabled(tool.name))),
+    /**
+     * resolveWooCommerceChange bound to this instance: a value that holds a piece of
+     * this instance's key or secret is left out of the values.
+     */
+    resolveChange(toolName: string, input: GatewayJsonObject = {}, resolveOptions: { pseudonymKey?: string | Uint8Array } = {}) {
+      return resolveWooCommerceChange(toolName, input, { ...resolveOptions, redactor });
+    },
+    /** Tools enabled on this instance (the policy's or WOOCOMMERCE_DISABLED_TOOLS' disabled tools are left out). */
+    tools: underPolicy(() => wooCommerceGatewayTools.filter(tool => !isToolDisabled(tool.name))),
     callTool(toolName: string, input: GatewayJsonObject = {}, context?: GatewayCallContext): Promise<GatewayToolResult> {
       // The whole result, text and data (keys included, numbers by their string form), with this instance's secrets
       // redacted: upstream data can echo the key, and so can an error. Redacted first, as data and depth-limited, and
@@ -282,15 +444,14 @@ function buildGateway(options: ExampleGatewayOptions, apiKey: string) {
       const tool = name ? findTool(`${TOOL_PREFIX}${stripPrefix(name)}`) : undefined;
       if (!tool) {
         // Redacted before it is cut short: a cut key would no longer match the redactor.
-        const reason = `Unsupported Example gateway tool: ${redactor.redact(String(toolName)).slice(0, 100)}`;
-        await auditRejectedCall(String(toolName), input, reason, context);
-        return errorResult(redactor.redact(reason));
+        await auditRejectedCall(String(toolName), input, 'unknown_tool', context);
+        return errorResult('Unsupported WooCommerce gateway tool.');
       }
 
       const parsed = tool.inputSchema.safeParse(input ?? {});
       if (!parsed.success) {
         const reason = `Invalid input for ${name}: ${z.prettifyError(parsed.error)}`;
-        await auditRejectedCall(tool.name, input, 'invalid input', context);
+        await auditRejectedCall(tool.name, input, 'invalid_input', context);
         return errorResult(redactor.redact(reason));
       }
 
@@ -303,8 +464,8 @@ function buildGateway(options: ExampleGatewayOptions, apiKey: string) {
   }
 }
 
-/** One gateway instance, as returned by createExampleGateway. */
-export type ExampleGateway = ReturnType<typeof createExampleGateway>;
+/** One gateway instance, as returned by createWooCommerceGateway. */
+export type WooCommerceGateway = ReturnType<typeof createWooCommerceGateway>;
 
 /** The data as it came; callTool redacts it and only then copies it as JSON. */
 function jsonResult(text: string, structuredContent: unknown): GatewayToolResult {

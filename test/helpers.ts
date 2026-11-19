@@ -2,11 +2,14 @@ import { readFileSync } from 'node:fs';
 import { vi } from 'vitest';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
-import { ExampleClient } from '../src/example/client.js';
-import { createExampleGateway } from '../src/gateway.js';
+import { WooCommerceClient } from '../src/woocommerce/client.js';
+import { createWooCommerceGateway } from '../src/gateway.js';
 import { createServer } from '../src/server.js';
 
-export const BASE = 'https://api.vendor.test/v1';
+export const SHOP = 'https://shop.example.com';
+export const BASE = `${SHOP}/wp-json/wc/v3`;
+/** A consumer secret for tests: random-looking, so it passes key admission. */
+export const SECRET = 'Qz7xK2vN9pL4wR8mT3bY'; // gitleaks:allow
 
 export type Stub = { status?: number; body?: unknown; raw?: string };
 
@@ -32,7 +35,7 @@ export function stubFetch(routes: Record<string, Stub>) {
 }
 
 export function makeClient(fetchImpl: unknown) {
-  return new ExampleClient({ apiKey: 'test-api-key', baseUrl: BASE, fetchImpl: fetchImpl as typeof fetch });
+  return new WooCommerceClient({ consumerKey: 'test-api-key', consumerSecret: SECRET, shopUrl: SHOP, fetchImpl: fetchImpl as typeof fetch });
 }
 
 export async function connect(routes: Record<string, Stub> = {}) {
@@ -46,9 +49,10 @@ export async function connect(routes: Record<string, Stub> = {}) {
 
 export function gateway(routes: Record<string, Stub> = {}) {
   const fetchImpl = stubFetch(routes);
-  const gw = createExampleGateway({
-    apiKey: 'tttt-gggg-wwww-vvvv-1',
-    baseUrl: BASE,
+  const gw = createWooCommerceGateway({
+    consumerKey: 'tttt-gggg-wwww-vvvv-1',
+    consumerSecret: SECRET,
+    shopUrl: SHOP,
     fetchImpl: fetchImpl as unknown as typeof fetch,
   });
   return { gw, fetchImpl };

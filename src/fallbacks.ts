@@ -19,7 +19,7 @@ export function withheldAuditRecord(): Record<string, unknown> {
 }
 
 /** The stderr line written instead of one that held a piece of the key. */
-export const STDERR_WITHHELD = '[example-mcp] audit log write failed.';
+export const STDERR_WITHHELD = '[woocommerce-mcp] audit log write failed.';
 
 /** Names a host may log with a refusal: the error classes a gateway throws. */
 const ERROR_NAMES = ['ConfigError', 'Error'];
