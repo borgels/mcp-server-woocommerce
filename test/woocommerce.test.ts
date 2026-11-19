@@ -82,7 +82,7 @@ const ORDER = {
 
 describe('reads', () => {
   it('checks the connection with one order and reports the total from X-WP-Total', async () => {
-    const { gw, calls } = shop({ 'GET /orders': withHeaders([{ id: 1 }], { 'X-WP-Total': '42', 'X-WP-TotalPages': '42' }) });
+    const { gw, calls } = shop({ 'GET /orders': withHeaders([{ id: 1, status: 'processing' }], { 'X-WP-Total': '42', 'X-WP-TotalPages': '42' }) });
     const result = await call(gw, 'check_connection');
     expect(result.isError).toBeUndefined();
     expect(result.structuredContent).toEqual({ connected: true, orders: 42 });
@@ -396,5 +396,65 @@ describe('audit', () => {
     expect(records[0]?.target).toEqual({ orderId: 727, amount: 50, currency: 'DKK' });
     const search = records.find(record => record.tool === 'woocommerce_list_customers')?.target as Record<string, unknown>;
     expect(search.searchSha256).toMatch(/^[0-9a-f]{64}$/);
+  });
+});
+
+describe('after review 1', () => {
+  it('refuses a record with another id than asked for, a field of the wrong type, and an invalid sub-item', async () => {
+    const bad: Array<[string, GatewayJsonObject, Record<string, unknown>]> = [
+      ['get_order', { orderId: 727 }, { 'GET /orders/727': { ...ORDER, id: 728 } }],
+      ['get_order', { orderId: 727 }, { 'GET /orders/727': { ...ORDER, status: { nested: 'x', more: { deeper: 1 } } } }],
+      ['get_order', { orderId: 727 }, { 'GET /orders/727': { ...ORDER, total: { amount: 1 } } }],
+      ['get_order', { orderId: 727 }, { 'GET /orders/727': { ...ORDER, billing: { first_name: { x: 1 } } } }],
+      ['get_order', { orderId: 727 }, { 'GET /orders/727': { ...ORDER, line_items: [ORDER.line_items[0], { name: 'no id' }] } }],
+      ['get_order', { orderId: 727 }, { 'GET /orders/727': { ...ORDER, line_items: [ORDER.line_items[0], null] } }],
+      ['get_order', { orderId: 727 }, { 'GET /orders/727': { ...ORDER, refunds: [{ id: 1, total: 'many' }] } }],
+      ['get_product', { productId: 31 }, { 'GET /products/31': { id: 32 } }],
+      ['get_product', { productId: 31 }, { 'GET /products/31': { id: 31, categories: [{ name: 'no id' }] } }],
+      ['get_customer', { customerId: 21 }, { 'GET /customers/21': { id: 22 } }],
+      ['get_customer', { customerId: 21 }, { 'GET /customers/21': { id: 21, email: ['a'] } }],
+      ['update_order_status', { orderId: 727, status: 'completed' }, { 'GET /orders/727': ORDER, 'PUT /orders/727': { ...ORDER, id: 1 } }],
+      ['update_order_status', { orderId: 727, status: 'completed' }, { 'GET /orders/727': ORDER, 'PUT /orders/727': ORDER }],
+      ['update_product', { productId: 31, name: 'x' }, { 'PUT /products/31': { id: 30 } }],
+      ['create_draft_product', { name: 'x' }, { 'POST /products': { id: 31, status: 'publish' } }],
+      ['list_orders', {}, { 'GET /orders': [ORDER, { ...ORDER, id: 1, status: 7 }] }],
+      ['get_sales_report', { period: 'week' }, { 'GET /reports/sales': [{ total_sales: '1.00' }, { total_sales: '2.00' }] }],
+      ['get_sales_report', { period: 'week' }, { 'GET /reports/sales': [{ total_sales: '1.00', totals: { '2026-11-01': { sales: {} } } }] }],
+    ];
+    for (const [tool, input, routes] of bad) {
+      const result = await call(shop(routes).gw, tool, input);
+      expect(result.isError, `${tool} ${JSON.stringify(routes)}`).toBe(true);
+      expect(JSON.stringify(result)).not.toMatch(/nested|deeper|no id/);
+    }
+  });
+
+  it('passes on only the fields its schema names, sub-objects included', async () => {
+    const { gw } = shop({
+      'GET /orders/727': { ...ORDER, billing: { ...ORDER.billing, plugin_field: 'x' }, line_items: [{ ...ORDER.line_items[0], plugin: { a: 1 } }] },
+    });
+    const text = JSON.stringify((await call(gw, 'get_order', { orderId: 727 })).structuredContent);
+    expect(text).not.toMatch(/plugin|meta_data/);
+  });
+
+  it('keeps no name or address of the caller in the audit, and replaces a request id that is not an opaque token', async () => {
+    const records: Array<Record<string, unknown>> = [];
+    const gw = createWooCommerceGateway({
+      consumerKey: KEY,
+      consumerSecret: SECRET,
+      shopUrl: SHOP,
+      fetchImpl: (async () => Response.json({ id: 21 })) as typeof fetch,
+      policy: { audit: record => void records.push({ ...record }), pseudonymKey: 'host-pseudonym-key-0001' },
+    });
+    await gw.callTool('get_customer', { customerId: 21 }, { caller: 'jens.jensen@example.test', requestId: 'Jens Jensen, Aarhus' });
+    await gw.callTool('get_customer', { customerId: 21 }, { caller: 'jens.jensen@example.test', requestId: 'req-42' });
+    const text = JSON.stringify(records);
+    expect(text).not.toMatch(/jens|Jensen|Aarhus/i);
+    expect(records[0]?.caller).toMatch(/^hmac:[0-9a-f]{16}$/);
+    expect(records[0]?.caller).toBe(records.at(-1)?.caller);
+    expect(records[0]?.requestId).toMatch(/^[0-9a-f-]{36}$/);
+    expect(records.at(-1)?.requestId).toBe('req-42');
+    expect(() =>
+      createWooCommerceGateway({ consumerKey: KEY, consumerSecret: SECRET, shopUrl: SHOP, policy: { pseudonymKey: 'short' } }),
+    ).toThrow(/pseudonymKey/);
   });
 });

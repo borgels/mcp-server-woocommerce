@@ -35,5 +35,12 @@ API v3 documentation (https://woocommerce.github.io/woocommerce-rest-api-docs/).
 - Built with the lessons of an earlier server's review: results redacted on
   the standalone MCP path as on the gateway, rejected calls audited with
   fixed codes, the change resolution runs the tool's own checks.
+- After review: the built-in fetch checks the shop's addresses in the
+  connection's own lookup, for every new connection, and connects to the
+  address checked (DNS rebinding); addresses are classified by value
+  (ipaddr.js), embedded IPv4 included. Answers are parsed with a schema per
+  resource, sub-objects and lists included; a record must have the id asked
+  for. The audit keeps the caller only as a pseudonym (`policy.pseudonymKey`)
+  and a request id only when it is an opaque token.
 - Not yet run against a live WooCommerce shop: the tests use answers shaped
   as the documentation shows them.

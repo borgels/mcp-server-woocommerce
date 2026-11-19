@@ -56,6 +56,8 @@
   "homepage": "https://github.com/borgels/mcp-server-woocommerce#readme",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.32.2",
+    "ipaddr.js": "2.5.0",
+    "undici": "8.12.3",
     "zod": "^4.6.7"
   },
   "overrides": {

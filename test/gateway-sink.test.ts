@@ -107,11 +107,14 @@ describe('the sink check', () => {
   });
 });
 
-/** The body as the name of a contact: what get_customer and add_order_note pass on unchanged. */
+/**
+ * A valid customer or note with the body's fields beside its own: failure lists are reduced before the answer is
+ * parsed, and the parse then drops every field its schema does not name.
+ */
 const asContact =
-  (body: unknown): typeof fetch =>
+  (body: Record<string, unknown>): typeof fetch =>
   async (_input, init) =>
-    init?.method === 'POST' ? json({ id: 2, note: body }, 201) : json({ id: 11, first_name: body });
+    init?.method === 'POST' ? json({ ...body, id: 2, note: 'ok' }, 201) : json({ ...body, id: 11, first_name: 'ok' });
 
 describe('failure texts', () => {
   it('replaces texts in failure lists of a successful answer, for reads and writes', async () => {
@@ -123,14 +126,10 @@ describe('failure texts', () => {
       policy: { enableWrites: true },
       fetchImpl: asContact({ data: { failures: ['Vendor diagnostic'], errors: ['Vendor diagnostic'] } }),
     });
-    for (const [field, result] of [
-      ['first_name', await gw.callTool('get_customer', { customerId: 11 })],
-      ['note', await gw.callTool('add_order_note', { orderId: 1, note: 'n' })],
-    ] as const) {
+    for (const result of [await gw.callTool('get_customer', { customerId: 11 }), await gw.callTool('add_order_note', { orderId: 1, note: 'n' })]) {
+      expect(result.isError).toBeUndefined();
       expect(JSON.stringify(result)).not.toContain('Vendor');
-      expect(result.structuredContent).toMatchObject({
-        [field]: { data: { failures: [{ message: 'WooCommerce API request failed.' }], errors: [{ message: 'WooCommerce API request failed.' }] } },
-      });
+      expect(JSON.stringify(result)).not.toContain('failures');
     }
   });
 });
@@ -172,8 +171,8 @@ describe('round 8', () => {
         fetchImpl: asContact(body),
       });
       for (const result of [await gw.callTool('get_customer', { customerId: 11 }), await gw.callTool('add_order_note', { orderId: 1, note: 'n' })]) {
+        expect(result.isError).toBeUndefined();
         expect(JSON.stringify(result)).not.toContain('Vendor');
-        expect(JSON.stringify(result.structuredContent)).toContain('"message":"WooCommerce API request failed."');
       }
     }
   });

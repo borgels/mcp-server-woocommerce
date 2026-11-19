@@ -102,8 +102,8 @@ describe('instance policy from the host', () => {
     });
     await gw.callTool('get_customer', { customerId: 12 }, { requestId: 'r1', caller: 'person-1' });
     expect(records.map(r => [r.requestId, r.action, r.caller])).toEqual([
-      ['r1', 'start', 'person-1'],
-      ['r1', 'finish', 'person-1'],
+      ['r1', 'start', expect.stringMatching(/^sha256:[0-9a-f]{16}$/)],
+      ['r1', 'finish', expect.stringMatching(/^sha256:[0-9a-f]{16}$/)],
     ]);
 
     const fetchImpl = routes();

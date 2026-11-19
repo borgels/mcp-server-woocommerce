@@ -43,6 +43,12 @@ export interface InstancePolicy {
    * throws refuses the write.
    */
   audit?: AuditSink;
+  /**
+   * Key for the pseudonym of the caller in audit records (HMAC-SHA-256). The
+   * caller a host passes is never logged in clear; without a key it is a
+   * plain SHA-256 pseudonym, which a list of guesses can reverse.
+   */
+  pseudonymKey?: string | Uint8Array;
 }
 
 /** An InstancePolicy, checked and normalised. */
@@ -50,6 +56,7 @@ export interface ResolvedInstancePolicy {
   readonly enableWrites: boolean;
   readonly disabledTools: ReadonlySet<string>;
   readonly audit?: AuditSink;
+  readonly pseudonymKey?: string | Uint8Array;
 }
 
 /** What one gateway call runs under: the host's policy (none: the environment applies) and the instance's redactor. */
@@ -74,6 +81,10 @@ export function resolveInstancePolicy(policy: InstancePolicy, knownTools: readon
   if (policy.audit !== undefined && typeof policy.audit !== 'function') {
     throw new ConfigError('policy.audit must be a function');
   }
+  const key = policy.pseudonymKey;
+  if (key !== undefined && !((typeof key === 'string' || key instanceof Uint8Array) && key.length >= 16)) {
+    throw new ConfigError('policy.pseudonymKey must be a string or bytes of at least 16.');
+  }
   const known = new Set(knownTools);
   const disabled = new Set<string>();
   for (const [index, name] of (policy.disabledTools ?? []).entries()) {
@@ -87,6 +98,7 @@ export function resolveInstancePolicy(policy: InstancePolicy, knownTools: readon
     enableWrites: policy.enableWrites === true,
     disabledTools: disabled,
     ...(policy.audit ? { audit: policy.audit } : {}),
+    ...(policy.pseudonymKey ? { pseudonymKey: policy.pseudonymKey } : {}),
   });
 }
 

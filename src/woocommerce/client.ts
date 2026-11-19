@@ -2,6 +2,8 @@ import { ConfigError, readEnvBoolean, readEnvInteger, readEnvString, type Env } 
 import { WooCommerceHttpError, describeUrl, parseRetryAfterMs, SecretRedactor } from '../errors.js';
 import { createHash } from 'node:crypto';
 import { USER_AGENT } from '../version.js';
+import ipaddr from 'ipaddr.js';
+import { pinnedFetch, systemResolve, type ResolveHost } from './network.js';
 
 
 export interface WooCommerceClientOptions {
@@ -24,12 +26,13 @@ export interface WooCommerceClientOptions {
    */
   allowPrivateHost?: boolean;
   /**
-   * Resolves the shop's host name to addresses before each request, so a
-   * name that points to a private address is refused. Default: the
-   * system resolver (node:dns). When `fetchImpl` is given and this is not,
-   * no lookup is made: the host that supplies the fetch decides where it goes.
+   * Resolves the shop's host name for each new connection of the built-in
+   * fetch (default: the system resolver). Every address must be public, and
+   * the connection goes to the address checked (see network.ts). Not used
+   * when `fetchImpl` is given: the host that supplies the fetch decides where
+   * it connects.
    */
-  resolveHost?: (hostname: string) => Promise<readonly string[]>;
+  resolveHost?: ResolveHost;
   fetchImpl?: typeof fetch;
   /** Per-attempt timeout covering headers and body (default 30 s, env WOOCOMMERCE_TIMEOUT_MS). */
   timeoutMs?: number;
@@ -186,9 +189,7 @@ export class WooCommerceClient implements UpstreamClient {
   private readonly missing?: string;
   /** The REST API base: the shop's address and API_PATH. */
   readonly baseUrl?: string;
-  private readonly hostname?: string;
   private readonly allowPrivateHost: boolean;
-  private readonly resolveHost?: (hostname: string) => Promise<readonly string[]>;
   private readonly fetchImpl: typeof fetch;
   private readonly timeoutMs: number;
   private readonly maxResponseBytes: number;
@@ -214,11 +215,11 @@ export class WooCommerceClient implements UpstreamClient {
     const shopUrl = options.shopUrl ?? readEnvString('WOOCOMMERCE_SHOP_URL', credentialEnv);
     if (shopUrl !== undefined) {
       const shop = assertSafeShopUrl(trimTrailingSlash(shopUrl), this.allowPrivateHost);
-      this.hostname = shop.hostname;
       this.baseUrl = `${trimTrailingSlash(`${shop.origin}${shop.pathname}`)}${API_PATH}`;
     }
-    this.resolveHost = options.resolveHost ?? (options.fetchImpl ? undefined : systemResolve);
-    this.fetchImpl = options.fetchImpl ?? fetch;
+    // The built-in fetch connects only to public addresses of the shop, checked for every new connection. With
+    // allowPrivateHost (local development) it is the plain fetch.
+    this.fetchImpl = options.fetchImpl ?? (this.allowPrivateHost ? fetch : pinnedFetch(options.resolveHost ?? systemResolve));
     this.timeoutMs = intOption('timeoutMs', options.timeoutMs, 'WOOCOMMERCE_TIMEOUT_MS', 30_000, 1, MAX_TIMER_MS);
     this.maxResponseBytes = intOption(
       'maxResponseBytes',
@@ -294,20 +295,6 @@ export class WooCommerceClient implements UpstreamClient {
     };
   }
 
-  /** Refuses, before anything is sent, a shop name that resolves to a loopback, private or link-local address. */
-  private async checkHost(): Promise<void> {
-    if (!this.resolveHost || this.allowPrivateHost || !this.hostname) return;
-    let addresses: readonly string[];
-    try {
-      addresses = await this.resolveHost(this.hostname);
-    } catch {
-      throw new Error('The shop address could not be resolved. Check the shop address.');
-    }
-    if (addresses.length === 0 || addresses.some(isPrivateAddress)) {
-      throw new Error('Refused: the shop address points to a private or local network address.');
-    }
-  }
-
   private async request<T>(method: HttpMethod, url: string, body?: unknown): Promise<Page<T>> {
     if (method !== 'GET') {
       // The fixed list of writes: anything else is refused before the credentials are put in a header.
@@ -317,7 +304,6 @@ export class WooCommerceClient implements UpstreamClient {
       }
     }
     const headers = this.headers();
-    await this.checkHost();
     const init: RequestInit = { method, headers };
     if (body !== undefined) {
       headers['Content-Type'] = 'application/json';
@@ -426,6 +412,10 @@ export class WooCommerceClient implements UpstreamClient {
   private transportError(method: HttpMethod, _url: string, error: unknown): Error {
     if (isTimeoutError(error)) {
       return new Error(this.redactor.redact(`WooCommerce API request timed out after ${this.timeoutMs} ms (${method}).`));
+    }
+    // The connection's own check (network.ts) refused a private address: our own text.
+    if (causeCodes(error).includes('ERR_SHOP_PRIVATE_ADDRESS')) {
+      return new Error('Refused: the shop address points to a private or local network address.');
     }
     // Only a system error code (ECONNREFUSED, ENOTFOUND, ...) from the cause, never its message.
     const code = (error instanceof Error ? (error.cause as { code?: unknown } | undefined)?.code : undefined) ?? undefined;
@@ -650,46 +640,8 @@ function assertSafeShopUrl(shopUrl: string, allowPrivateHost: boolean): URL {
 }
 
 function isIpLiteral(host: string): boolean {
-  return host.startsWith('[') || /^\d{1,3}(\.\d{1,3}){3}$/.test(host) || /^[0-9a-f:]+$/i.test(host) && host.includes(':');
-}
-
-/** Loopback, private, link-local, carrier-grade NAT, unspecified, multicast and the IPv6 equivalents. */
-export function isPrivateAddress(address: string): boolean {
-  const value = address.toLowerCase();
-  const mapped = value.startsWith('::ffff:') ? value.slice(7) : value;
-  const v4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(mapped);
-  if (v4) {
-    const [a, b] = [Number(v4[1]), Number(v4[2])];
-    return (
-      a === 0 ||
-      a === 10 ||
-      a === 127 ||
-      (a === 100 && b >= 64 && b <= 127) ||
-      (a === 169 && b === 254) ||
-      (a === 172 && b >= 16 && b <= 31) ||
-      (a === 192 && b === 168) ||
-      (a === 198 && (b === 18 || b === 19)) ||
-      a >= 224
-    );
-  }
-  return (
-    value === '::' ||
-    value === '::1' ||
-    value.startsWith('fc') ||
-    value.startsWith('fd') ||
-    value.startsWith('fe8') ||
-    value.startsWith('fe9') ||
-    value.startsWith('fea') ||
-    value.startsWith('feb') ||
-    value.startsWith('ff')
-  );
-}
-
-/** The system resolver: every address the name has. */
-async function systemResolve(hostname: string): Promise<readonly string[]> {
-  const { lookup } = await import('node:dns/promises');
-  const answers = await lookup(hostname, { all: true, verbatim: true });
-  return answers.map(answer => answer.address);
+  const bare = host.replace(/^\[|\]$/g, '');
+  return host.startsWith('[') || ipaddr.isValid(bare) || /^[0-9.]+$/.test(bare) || /^0x/i.test(bare);
 }
 
 /** A count from a header: a whole number of at most 9 digits, else undefined. Nothing else of a header is kept. */

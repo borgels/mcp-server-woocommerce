@@ -26,21 +26,21 @@ function stub(key: string): typeof fetch {
   return async input => {
     const path = (String(input).split('?')[0] ?? '').slice(BASE.length);
     switch (path) {
-      case '/customers/13':
-        return json({ id: 11, first_name: { echo: Number(key), nested: { n: [Number(key.slice(1, 7)), Number(`${key}9`)] }, ok: true, count: 3 } });
+      case '/orders/13':
+        return json({ id: 13, status: 'processing', line_items: [{ id: 1, quantity: Number(key) }, { id: 2, quantity: Number(key.slice(1, 7)) }] });
       case '/customers/14':
         // The vendor's text and a piece of the key shorter than six characters.
         return failingBody(`Vendor diagnostic ${key.slice(0, 5)}`);
       case '/customers/9':
         return json({
-          id: 11,
+          id: 9,
           first_name: {
               metadata: { status: 401, error: `Vendor diagnostic ${key}` },
               failures: [{ status: 403, error: 'Vendor detail' }, { error: 'Vendor text' }],
             },
         });
       case '/customers/10':
-        return new Response(`{"id":11,"first_name":${'['.repeat(DEEP)}1${']'.repeat(DEEP)}}`, {
+        return new Response(`{"id":10,"extra":${'['.repeat(DEEP)}1${']'.repeat(DEEP)}}`, {
           status: 200,
           headers: { 'content-type': 'application/json' },
         });
@@ -55,11 +55,12 @@ describe('the threat model, through callTool', () => {
     const key = '1234567890123456';
     const records: unknown[] = [];
     const gw = createWooCommerceGateway({ consumerKey: key, consumerSecret: SECRET, shopUrl: SHOP, fetchImpl: stub(key), maxAttempts: 1, policy: { audit: r => void records.push(r) } });
-    const result = await gw.callTool('get_customer', { customerId: 13 });
+    const result = await gw.callTool('get_order', { orderId: 13 });
     expect(result.isError).toBeUndefined();
     expect(result.structuredContent).toEqual({
-      id: 11,
-      first_name: { echo: '‹redacted›', nested: { n: ['‹redacted›', '‹redacted›'] }, ok: true, count: 3 },
+      id: 13,
+      status: 'processing',
+      line_items: [{ id: 1, quantity: '‹redacted›' }, { id: 2, quantity: '‹redacted›' }],
     });
     const serialised = JSON.stringify(result);
     expect(JSON.parse(serialised)).toEqual(result);
@@ -79,16 +80,11 @@ describe('the threat model, through callTool', () => {
     }
   });
 
-  it('reduces failures reported inside a successful body to status-only text', async () => {
+  it('refuses a failure object where data should be, with our own text and nothing of the vendor', async () => {
     const gw = createWooCommerceGateway({ consumerKey: KEY, consumerSecret: SECRET, shopUrl: SHOP, fetchImpl: stub(KEY), maxAttempts: 1 });
     const result = await gw.callTool('get_customer', { customerId: 9 });
-    expect(result.structuredContent).toEqual({
-      id: 11,
-      first_name: {
-        metadata: { status: 401, error: 'WooCommerce API request failed with HTTP 401' },
-        failures: [{ status: 403, message: 'WooCommerce API request failed with HTTP 403' }, { message: 'WooCommerce API request failed.' }],
-      },
-    });
+    expect(result.isError).toBe(true);
+    expect(result.content[0]?.text).toContain('without the expected data');
     expect(JSON.stringify(result)).not.toContain('Vendor');
   });
 
@@ -96,7 +92,8 @@ describe('the threat model, through callTool', () => {
     const gw = createWooCommerceGateway({ consumerKey: KEY, consumerSecret: SECRET, shopUrl: SHOP, fetchImpl: stub(KEY), maxAttempts: 1, maxResponseBytes: 1_000_000 });
     const result = await gw.callTool('get_customer', { customerId: 10 });
     expect(result.isError).toBeUndefined();
-    expect(JSON.stringify(result)).toContain('[nested too deep]');
+    // The deep field is not in the customer schema and is dropped.
+    expect(result.structuredContent).toEqual({ id: 10 });
   });
 });
 
@@ -137,18 +134,12 @@ describe('round 5 of the threat model, through callTool', () => {
       shopUrl: SHOP,
       maxAttempts: 1,
       fetchImpl: async (_input, init) =>
-        init?.method === 'POST' ? json({ id: 2, note: body }, 201) : json({ id: 11, first_name: body }),
+        init?.method === 'POST' ? json({ ...body, id: 2, note: 'ok' }, 201) : json({ ...body, id: 11, first_name: 'ok' }),
       policy: { enableWrites: true },
     });
-    for (const [field, result] of [
-      ['first_name', await gw.callTool('get_customer', { customerId: 11 })],
-      ['note', await gw.callTool('add_order_note', { orderId: 1, note: 'n' })],
-    ] as const) {
+    for (const result of [await gw.callTool('get_customer', { customerId: 11 }), await gw.callTool('add_order_note', { orderId: 1, note: 'n' })]) {
       expect(result.isError, JSON.stringify(result.content)).toBeUndefined();
-      expect((result.structuredContent as Record<string, unknown>)[field]).toEqual({
-        metadata: { status: 401, error: 'WooCommerce API request failed with HTTP 401' },
-        failures: [{ message: 'WooCommerce API request failed.' }],
-      });
+      expect(JSON.stringify(result)).not.toMatch(/Vendor|VENDOR|metadata|failures/);
     }
   });
 
@@ -247,24 +238,15 @@ describe('round 6 of the threat model', () => {
       fetchImpl: async () =>
         json({
           id: 11,
-          first_name: {
-              failures: [{ status: 403, message: 'Vendor diagnostic' }],
-              metadata: { status: 401, error: null, message: 'Vendor diagnostic' },
-              errors: [{ message: 'Vendor diagnostic' }],
-              rows: [{ status: 200, message: 'kept' }],
-            },
+          first_name: 'ok',
+          failures: [{ status: 403, message: 'Vendor diagnostic' }],
+          metadata: { status: 401, error: null, message: 'Vendor diagnostic' },
+          errors: [{ message: 'Vendor diagnostic' }],
         }),
     });
     const result = await gw.callTool('get_customer', { customerId: 11 });
-    expect(result.structuredContent).toEqual({
-      id: 11,
-      first_name: {
-        failures: [{ status: 403, message: 'WooCommerce API request failed with HTTP 403' }],
-        metadata: { status: 401, error: 'WooCommerce API request failed with HTTP 401' },
-        errors: [{ message: 'WooCommerce API request failed.' }],
-        rows: [{ status: 200, message: 'kept' }],
-      },
-    });
+    expect(result.structuredContent).toEqual({ id: 11, first_name: 'ok' });
+    expect(JSON.stringify(result)).not.toContain('Vendor');
   });
 
   it('names a network error code only from the fixed list', async () => {

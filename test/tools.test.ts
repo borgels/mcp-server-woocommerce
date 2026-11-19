@@ -213,7 +213,8 @@ describe('gateway export', () => {
     expect(fetchImpl).toHaveBeenCalledTimes(1);
 
     const lines = auditLines(process.env.WOOCOMMERCE_AUDIT_LOG);
-    expect(lines[0]).toMatchObject({ requestId: 'req-1', caller: 'user@vendor.test', action: 'start' });
+    expect(lines[0]).toMatchObject({ requestId: 'req-1', caller: expect.stringMatching(/^sha256:[0-9a-f]{16}$/), action: 'start' });
+    expect(JSON.stringify(lines)).not.toContain('user@vendor.test');
     expect(lines.map(line => line.action)).toEqual(['start', 'finish', 'rejected', 'rejected', 'policy_denied']);
   });
 });

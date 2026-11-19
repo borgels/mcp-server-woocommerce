@@ -200,16 +200,21 @@ const SAMPLE_INPUTS: Record<string, GatewayJsonObject> = {
   update_customer: { customerId: 21, billing: { phone: '12345678' } },
 };
 
-/** Answers that let every tool run to its end: a processing order of 100 DKK, a sales report, records with ids. */
+/** Answers that let every tool run to its end: a processing order of 100 DKK, a sales report, the record asked for. */
 async function catalogFetch(input: string | URL | Request, init?: RequestInit): Promise<Response> {
   const path = new URL(String(input)).pathname;
+  const method = init?.method ?? 'GET';
   if (path.endsWith('/reports/sales')) return Response.json([{ total_sales: '100.00', net_sales: '80.00' }]);
-  if (/\/orders\/\d+$/.test(path)) {
-    return Response.json({ id: 12, status: 'processing', currency: 'DKK', total: '100.00', refunds: [], line_items: [] });
+  const orderId = /\/orders\/(\d+)$/.exec(path)?.[1];
+  if (orderId) {
+    const status = method === 'PUT' ? (JSON.parse(String(init?.body)) as { status: string }).status : 'processing';
+    return Response.json({ id: Number(orderId), status, currency: 'DKK', total: '100.00', refunds: [], line_items: [] });
   }
-  // A list of one record for lists, one record for everything else.
-  if ((init?.method ?? 'GET') === 'GET' && /\/(orders|products|customers|notes|refunds)$/.test(path)) return Response.json([{ id: 1 }]);
-  return Response.json({ id: 1 });
+  if (method === 'GET' && /\/orders$/.test(path)) return Response.json([{ id: 1, status: 'processing' }]);
+  if (method === 'GET' && /\/(products|customers|notes|refunds)$/.test(path)) return Response.json([{ id: 1 }]);
+  const recordId = /\/(\d+)$/.exec(path)?.[1];
+  if (method === 'POST' && path.endsWith('/products')) return Response.json({ id: 1, status: 'draft' });
+  return Response.json({ id: recordId ? Number(recordId) : 1 });
 }
 
 describe('tool catalog', () => {

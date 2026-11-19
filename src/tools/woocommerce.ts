@@ -36,6 +36,7 @@ import {
 import {
   checkInputPolicy,
   checkToolPolicy,
+  currentInstancePolicy,
   isToolDisabled,
   redactInScope,
   runInCallScope,
@@ -586,11 +587,22 @@ function contextString(value: unknown, max: number): string | undefined {
 }
 
 /** Normalise a host-supplied context; malformed values are ignored. */
+/** A request id the audit keeps: an opaque token (letters, digits, `.`, `_`, `:`, `-`), at most 128 characters. */
+const REQUEST_ID_PATTERN = /^[A-Za-z0-9._:-]{1,128}$/;
+
+/**
+ * The audit's view of a call context. A request id that is not an opaque
+ * token is replaced by a new one (it could hold a name or an address). The
+ * caller is never kept in clear: it becomes a pseudonym, keyed with the
+ * host's policy.pseudonymKey when given.
+ */
 export function normaliseCallContext(context: unknown): { requestId: string; caller?: string } {
   const value = (context && typeof context === 'object' ? context : {}) as Record<string, unknown>;
+  const requestId = typeof value.requestId === 'string' && REQUEST_ID_PATTERN.test(value.requestId) ? value.requestId : newRequestId();
+  const caller = contextString(value.caller, 320);
   return {
-    requestId: contextString(value.requestId, 200) ?? newRequestId(),
-    caller: contextString(value.caller, 320),
+    requestId,
+    ...(caller === undefined ? {} : { caller: pseudonym(caller, currentInstancePolicy()?.pseudonymKey) }),
   };
 }
 

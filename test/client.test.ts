@@ -2,6 +2,7 @@ import { createServer as createHttpServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { API_KEY_HEADER, WooCommerceClient } from '../src/woocommerce/client.js';
+import { isPublicAddress, pinnedLookup } from '../src/woocommerce/network.js';
 import { WooCommerceHttpError, parseRetryAfterMs, redactSecrets, SecretRedactor } from '../src/errors.js';
 import { USER_AGENT } from '../src/version.js';
 
@@ -149,32 +150,85 @@ describe('WooCommerceClient', () => {
     expect(make('http://shop.example.com', true)).toThrow('https://');
   });
 
-  it('refuses a shop name that resolves to a private address, before sending anything', async () => {
-    const fetchImpl = makeFetch(() => ({ id: 1 }));
-    for (const addresses of [['10.0.0.5'], ['203.0.113.10', '192.168.1.1'], ['::1'], ['fd00::1'], ['169.254.169.254'], []]) {
+  it('connects only to public addresses, checked by the connection itself, in every spelling', async () => {
+    const PUBLIC = '1.1.1.1'; // hygiene:allow (a well-known public resolver address, used as "a public address")
+    for (const addresses of [
+      ['10.0.0.5'],
+      [PUBLIC, '192.168.1.1'],
+      ['::1'],
+      ['0:0:0:0:0:0:0:1'],
+      ['::ffff:7f00:1'],
+      ['::ffff:127.0.0.1'],
+      ['64:ff9b::a00:1'],
+      ['2002:7f00:1::'],
+      ['fd00::1'],
+      ['fe80::1'],
+      ['169.254.169.254'],
+      ['100.64.0.1'],
+      ['0.0.0.0'],
+      [],
+    ]) {
+      const resolved: string[] = [];
       const client = new WooCommerceClient({
         consumerKey: 'k',
         consumerSecret: 's',
         shopUrl: SHOP,
-        fetchImpl,
-        resolveHost: async () => addresses,
+        maxAttempts: 1,
+        resolveHost: async hostname => {
+          resolved.push(hostname);
+          return addresses;
+        },
       });
-      await expect(client.get('/orders'), addresses.join()).rejects.toThrow(/private or local|could not be resolved|Refused/);
+      await expect(client.get('/orders'), addresses.join()).rejects.toThrow('private or local network address');
+      // The name was resolved by the connection; the address used would have been the one checked.
+      expect(resolved, addresses.join()).toEqual(['shop.example.com']);
     }
     const failing = new WooCommerceClient({
       consumerKey: 'k',
       consumerSecret: 's',
       shopUrl: SHOP,
-      fetchImpl,
+      maxAttempts: 1,
       resolveHost: async () => {
         throw new Error('ENOTFOUND');
       },
     });
-    await expect(failing.get('/orders')).rejects.toThrow('could not be resolved');
-    expect(fetchImpl).not.toHaveBeenCalled();
+    await expect(failing.get('/orders')).rejects.toThrow(/Network error calling the WooCommerce API \(GET\) \(ENOTFOUND\)/);
+  });
 
-    const ok = new WooCommerceClient({ consumerKey: 'k', consumerSecret: 's', shopUrl: SHOP, fetchImpl, resolveHost: async () => ['203.0.113.10'] });
-    await expect(ok.get('/orders')).resolves.toEqual({ id: 1 });
+  it('checks the address for every new connection, so a changed DNS answer is checked again', async () => {
+    const PUBLIC = '1.1.1.1'; // hygiene:allow (a well-known public resolver address, used as "a public address")
+    const answers = [[PUBLIC], ['127.0.0.1']];
+    const lookup = pinnedLookup(async () => answers.shift() ?? []);
+    const run = () =>
+      new Promise<{ error: unknown; address: unknown }>(resolve =>
+        lookup('shop.example.com', { all: true }, (error, address) => resolve({ error, address })),
+      );
+    expect(await run()).toEqual({ error: null, address: [{ address: PUBLIC, family: 4 }] });
+    const second = await run();
+    expect((second.error as { code?: string }).code).toBe('ERR_SHOP_PRIVATE_ADDRESS');
+  });
+
+  it('classifies addresses by their value, not their spelling', () => {
+    const PUBLIC = '1.1.1.1'; // hygiene:allow (a well-known public resolver address, used as "a public address")
+    expect(isPublicAddress(PUBLIC)).toBe(true);
+    expect(isPublicAddress(`::ffff:${PUBLIC}`)).toBe(true);
+    for (const address of [
+      '127.0.0.1',
+      '0:0:0:0:0:0:0:1',
+      '::1',
+      '::ffff:7f00:1',
+      '::ffff:127.0.0.1',
+      '::127.0.0.1',
+      '64:ff9b::7f00:1',
+      '2002:a00:1::1',
+      '[::1]',
+      'fe80::1%eth0',
+      '203.0.113.10',
+      '224.0.0.1',
+      'not an address',
+    ]) {
+      expect(isPublicAddress(address), address).toBe(false);
+    }
   });
 
   it('gives the same shop identity for every key of a shop, and holds no credential', () => {

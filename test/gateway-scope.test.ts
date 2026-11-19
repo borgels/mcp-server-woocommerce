@@ -88,7 +88,8 @@ describe('audit records', () => {
     expect(text).not.toContain(LONG_KEY);
     // Not even a part of it.
     expect(text).not.toContain('k'.repeat(40));
-    expect(text).toContain('‹redacted›');
+    // The caller is a pseudonym; the request id holding the key is not an opaque token and was replaced.
+    expect(text).toMatch(/"caller":"sha256:[0-9a-f]{16}"/);
   });
 });
 
