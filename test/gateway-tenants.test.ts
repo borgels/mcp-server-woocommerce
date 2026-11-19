@@ -215,6 +215,9 @@ async function catalogFetch(input: string | URL | Request, init?: RequestInit): 
   const recordId = /\/(\d+)$/.exec(path)?.[1];
   if (method === 'POST' && path.endsWith('/products')) return Response.json({ id: 1, status: 'draft' });
   if (method === 'POST' && path.endsWith('/notes')) return Response.json({ id: 1, customer_note: false });
+  if (method === 'PUT' && /\/(products|customers)\/\d+$/.test(path)) {
+    return Response.json({ id: Number(/(\d+)$/.exec(path)?.[1]), ...(JSON.parse(String(init?.body)) as object) });
+  }
   if (method === 'POST' && path.endsWith('/refunds')) {
     const { amount } = JSON.parse(String(init?.body)) as { amount: string };
     return Response.json({ id: 1, amount, refunded_payment: false });

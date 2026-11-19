@@ -82,8 +82,8 @@ export function resolveInstancePolicy(policy: InstancePolicy, knownTools: readon
     throw new ConfigError('policy.audit must be a function');
   }
   const key = policy.pseudonymKey;
-  if (key !== undefined && !((typeof key === 'string' || key instanceof Uint8Array) && key.length >= 16)) {
-    throw new ConfigError('policy.pseudonymKey must be a string or bytes of at least 16.');
+  if (key !== undefined && !((typeof key === 'string' || key instanceof Uint8Array) && key.length >= 32)) {
+    throw new ConfigError('policy.pseudonymKey must be a string of at least 32 characters or at least 32 bytes.');
   }
   const known = new Set(knownTools);
   const disabled = new Set<string>();

@@ -10,8 +10,14 @@ import {
   type GatewayJsonObject,
 } from '../src/gateway.js';
 import { BASE, SECRET, SHOP } from './helpers.js';
+import { REDACTION_MARKER } from '../src/errors.js';
+import { fixedOutputs, RESULT_WITHHELD } from '../src/fallbacks.js';
+import { FIXED_CORPUS } from '../src/fixed-corpus.generated.js';
 
 const KEY = 'ck_tttt-gggg-wwww-vvvv-1';
+// Pseudonym keys: 32 or more random printable characters that share no piece with any text of ours.
+const PSEUDONYM_KEY_1 = 'Qh7Vz2Lr9Xw4Nc8Tp3Yk6Bm1Fs5Jd0Ga'; // gitleaks:allow (a test value, not a key)
+const PSEUDONYM_KEY_2 = 'Wy3Rk8Pq1Zt6Hv9Lc2Xn5Bg7Md4Js0Fe'; // gitleaks:allow (a test value, not a key)
 const originalEnv = { ...process.env };
 
 beforeEach(() => {
@@ -47,6 +53,9 @@ function shop(routes: Record<string, unknown>, key = KEY) {
   });
   return { gw, calls, fetchImpl };
 }
+
+/** A write answer as the documentation shows it: the record with the values sent. */
+const echoBody = (id: number) => (_url: URL, init: RequestInit) => ({ id, ...(JSON.parse(String(init.body)) as object) });
 
 const withHeaders = (body: unknown, headers: Record<string, string>) => () => Response.json(body, { headers });
 
@@ -292,7 +301,7 @@ describe('writes', () => {
   });
 
   it('updates only the product fields given, and needs at least one', async () => {
-    const { gw, calls } = shop({ 'PUT /products/31': { id: 31, stock_quantity: 4 } });
+    const { gw, calls } = shop({ 'PUT /products/31': echoBody(31) });
     expect((await call(gw, 'update_product', { productId: 31, stock_quantity: 4, manage_stock: true })).isError).toBeUndefined();
     expect(calls[0]?.body).toEqual({ manage_stock: true, stock_quantity: 4 });
     expect((await call(gw, 'update_product', { productId: 31 })).isError).toBe(true);
@@ -300,7 +309,7 @@ describe('writes', () => {
   });
 
   it('updates a customer’s name and addresses, never the e-mail, password or role', async () => {
-    const { gw, calls } = shop({ 'PUT /customers/21': { id: 21, first_name: 'Jens' } });
+    const { gw, calls } = shop({ 'PUT /customers/21': echoBody(21) });
     expect((await call(gw, 'update_customer', { customerId: 21, billing: { phone: '87654321', city: 'Aarhus' } })).isError).toBeUndefined();
     expect(calls[0]?.body).toEqual({ billing: { city: 'Aarhus', phone: '87654321' } });
     for (const input of [
@@ -388,14 +397,15 @@ describe('audit', () => {
       maxAttempts: 1,
       fetchImpl: (async (input: string | URL | Request, init?: RequestInit) => {
         const path = new URL(String(input)).pathname;
-        if (init?.method === 'POST') return Response.json({ id: 9, amount: '50.00' });
+        if (init?.method === 'POST') return Response.json({ id: 9, amount: '50.00', refunded_payment: false });
         if (path.endsWith('/orders/727')) return Response.json(ORDER);
         return Response.json([]);
       }) as typeof fetch,
       policy: { enableWrites: true, audit: record => void records.push({ ...record }) },
     });
-    await gw.callTool('record_refund', { orderId: 727, amount: 50, currency: 'DKK', reason: 'Jens Jensen ringede' });
-    await gw.callTool('list_customers', { search: 'Anna Hansen' });
+    expect((await gw.callTool('record_refund', { orderId: 727, amount: 50, currency: 'DKK', reason: 'Jens Jensen ringede' })).isError).toBeUndefined();
+    expect((await gw.callTool('list_customers', { search: 'Anna Hansen' })).isError).toBeUndefined();
+    expect(records.filter(record => record.action === 'finish')).toHaveLength(2);
     const text = JSON.stringify(records);
     expect(text).not.toMatch(/Jens|Anna/);
     expect(records[0]?.target).toEqual({ orderId: 727, amount: 50, currency: 'DKK' });
@@ -448,7 +458,7 @@ describe('after review 1', () => {
       consumerSecret: SECRET,
       shopUrl: SHOP,
       fetchImpl: (async () => Response.json({ id: 21 })) as typeof fetch,
-      policy: { audit: record => void records.push({ ...record }), pseudonymKey: 'host-pseudonym-key-0001' },
+      policy: { audit: record => void records.push({ ...record }), pseudonymKey: PSEUDONYM_KEY_1 }, // gitleaks:allow (a test constant, not a key)
     });
     await gw.callTool('get_customer', { customerId: 21 }, { caller: 'jens.jensen@example.test', requestId: 'Jens Jensen, Aarhus' });
     await gw.callTool('get_customer', { customerId: 21 }, { caller: 'jens.jensen@example.test', requestId: 'req-42' });
@@ -466,7 +476,7 @@ describe('after review 1', () => {
 });
 
 describe('after review 2', () => {
-  const PSEUDONYM_KEY = 'host-pseudonym-key-0002';
+  const PSEUDONYM_KEY = PSEUDONYM_KEY_2; // gitleaks:allow (a test constant, not a key)
 
   it('never keeps a request id from the host in clear, whatever characters it uses', async () => {
     const records: Array<Record<string, unknown>> = [];
@@ -566,5 +576,156 @@ describe('after review 2', () => {
   it('keeps a status with a hyphen in the change resolution', () => {
     const resolved = resolveWooCommerceChange('update_order_status', { orderId: 727, status: 'on-hold' });
     expect(resolved.ok && resolved.change.values).toEqual({ orderId: 727, status: 'on-hold' });
+  });
+});
+
+describe('after review 3: the pseudonym key anywhere', () => {
+  /** Every piece of six characters of a key (the redactor's fragment length). */
+  const pieces = (key: string) => Array.from({ length: Math.max(0, key.length - 5) }, (_, i) => key.slice(i, i + 6));
+  /** The pieces of any form of the key found in any of the values, raw or serialised. */
+  const leaked = (forms: string[], values: unknown[]) => {
+    const texts = values.map(value => (typeof value === 'string' ? value : JSON.stringify(value) ?? ''));
+    return forms.flatMap(pieces).filter(piece => texts.some(text => text.includes(piece)));
+  };
+  const formsOf = (key: string | Uint8Array) =>
+    typeof key === 'string' ? [key] : ['hex', 'base64', 'base64url', 'latin1'].map(form => Buffer.from(key).toString(form as BufferEncoding));
+  const construct = (options: Record<string, unknown>): Error | undefined => {
+    try {
+      createWooCommerceGateway(options as never);
+      return undefined;
+    } catch (error) {
+      return error as Error;
+    }
+  };
+
+  // Every fixed text of ours long enough to be a key, the fallback texts joined, and texts of ours inside a key.
+  const OWN_TEXTS = [
+    ...FIXED_CORPUS.filter(text => text.length >= 32),
+    `${RESULT_WITHHELD}${REDACTION_MARKER}`,
+    `policy.enableWrites must be a boolean ${'z'.repeat(10)}`,
+    `WOOCOMMERCE_SHOP_URL-${'7'.repeat(12)}`,
+  ];
+  const BROKEN: Array<Record<string, unknown>> = [
+    {},
+    { shopUrl: 'not a url' },
+    { shopUrl: 'https://10.0.0.1/shop' },
+    { consumerKey: 'short' },
+    { policy: { enableWrites: 'yes' } },
+    { policy: { disabledTools: ['no_such_tool'] } },
+  ];
+
+  it('refuses a pseudonym key that shares text with ours, and no construction error shows a piece of it', () => {
+    let checked = 0;
+    for (const text of OWN_TEXTS) {
+      for (const key of [text, new TextEncoder().encode(text)]) {
+        for (const broken of BROKEN) {
+          const { policy: brokenPolicy, ...rest } = broken as { policy?: Record<string, unknown> };
+          const error = construct({
+            consumerKey: KEY,
+            consumerSecret: SECRET,
+            shopUrl: SHOP,
+            ...rest,
+            policy: { ...brokenPolicy, pseudonymKey: key },
+          });
+          expect(error, text).toBeInstanceOf(Error);
+          expect(leaked(formsOf(key), [error!.message, error!.stack, error!.name, error]), text).toEqual([]);
+          checked += 1;
+        }
+      }
+    }
+    expect(checked).toBeGreaterThan(50);
+  });
+
+  it('keeps an admitted pseudonym key out of construction errors, the tool list and every fixed output', () => {
+    for (const key of [PSEUDONYM_KEY_1, Buffer.from('a7f3c91e5b2d8046f1e9c3a7b5d20864d18b6e2f4a9c07e35b1d8f62c4a09e17', 'hex')]) {
+      for (const broken of BROKEN.slice(1)) {
+        const { policy: brokenPolicy, ...rest } = broken as { policy?: Record<string, unknown> };
+        const error = construct({ consumerKey: KEY, consumerSecret: SECRET, shopUrl: SHOP, ...rest, policy: { ...brokenPolicy, pseudonymKey: key } });
+        expect(error).toBeInstanceOf(Error);
+        expect(leaked(formsOf(key), [error!.message, error!.stack, error])).toEqual([]);
+      }
+      const gw = createWooCommerceGateway({ consumerKey: KEY, consumerSecret: SECRET, shopUrl: SHOP, policy: { pseudonymKey: key } });
+      expect(leaked(formsOf(key), [gw.tools, wooCommerceToolCatalog, fixedOutputs()])).toEqual([]);
+    }
+  });
+
+  it('refuses a pseudonym key that is too short, as text or bytes', () => {
+    for (const key of ['Qh7Vz2Lr9Xw4Nc8Tp3Yk6Bm', new Uint8Array(31)]) {
+      const error = construct({ consumerKey: KEY, consumerSecret: SECRET, shopUrl: SHOP, policy: { pseudonymKey: key } });
+      expect(error?.message).toMatch(/pseudonymKey/);
+    }
+  });
+
+  it('keeps an admitted pseudonym key out of results, errors and audit records wherever the shop or the host puts it', async () => {
+    const key = PSEUDONYM_KEY_1; // gitleaks:allow (a test constant, not a key)
+    const records: unknown[] = [];
+    const gw = createWooCommerceGateway({
+      consumerKey: KEY,
+      consumerSecret: SECRET,
+      shopUrl: SHOP,
+      maxAttempts: 1,
+      fetchImpl: (async (input: string | URL | Request) => {
+        const path = new URL(String(input)).pathname;
+        if (path.endsWith('/customers/21')) return Response.json({ id: 21, first_name: key, last_name: key.slice(3, 20), billing: { city: `x${key}x` } });
+        if (path.endsWith('/customers/22')) return Response.json({ code: key, message: key }, { status: 400 });
+        if (path.endsWith('/customers/23')) return new Response(null, { status: 302, headers: { location: `https://elsewhere.test/${key}` } });
+        throw new TypeError(`fetch failed ${key}`);
+      }) as typeof fetch,
+      policy: { audit: record => void records.push(record), pseudonymKey: key },
+    });
+    const results = [];
+    for (const customerId of [21, 22, 23, 24]) {
+      results.push(await gw.callTool('get_customer', { customerId }, { caller: key, requestId: key }));
+    }
+    results.push(await gw.callTool(`get_${key}`, { [key]: key }, { caller: key }));
+    results.push(await gw.callTool('get_customer', { customerId: 21, [key]: 1 }));
+    results.push(await gw.callTool('list_customers', { search: key }));
+    expect(results[0]?.isError).toBeUndefined();
+    expect(leaked([key], [results, records])).toEqual([]);
+  });
+});
+
+describe('after review 3: updates are confirmed by the answer', () => {
+  it('reports a product as updated only when the answer has every value sent', async () => {
+    const bad: Array<[GatewayJsonObject, Record<string, unknown>]> = [
+      [{ productId: 31, status: 'draft' }, { id: 31, status: 'publish' }],
+      [{ productId: 31, status: 'draft' }, { id: 31 }],
+      [{ productId: 31, regular_price: '49.00' }, { id: 31, regular_price: '59.00' }],
+      [{ productId: 31, sale_price: '' }, { id: 31, sale_price: '10.00' }],
+      [{ productId: 31, stock_quantity: 4 }, { id: 31, stock_quantity: 3 }],
+      [{ productId: 31, manage_stock: true }, { id: 31, manage_stock: false }],
+      [{ productId: 31, name: 'Kop' }, { id: 31, name: 'Krus' }],
+    ];
+    for (const [input, answer] of bad) {
+      const records: Array<Record<string, unknown>> = [];
+      const fetchImpl = (async () => Response.json(answer)) as typeof fetch;
+      const gw = createWooCommerceGateway({
+        consumerKey: KEY,
+        consumerSecret: SECRET,
+        shopUrl: SHOP,
+        maxAttempts: 1,
+        fetchImpl,
+        policy: { enableWrites: true, audit: record => void records.push({ ...record }) },
+      });
+      const result = await gw.callTool('update_product', input);
+      expect(result.isError, JSON.stringify([input, answer])).toBe(true);
+      expect(records.at(-1)?.action).toBe('error');
+    }
+    const { gw } = shop({ 'PUT /products/31': { id: 31, status: 'draft', regular_price: '49', sale_price: '', name: ' Kop ' } });
+    const ok = await call(gw, 'update_product', { productId: 31, status: 'draft', regular_price: '49.00', sale_price: '', name: 'Kop' });
+    expect(ok.isError).toBeUndefined();
+  });
+
+  it('reports a customer as updated only when the answer has every value sent, in the addresses too', async () => {
+    const bad: Array<[GatewayJsonObject, Record<string, unknown>]> = [
+      [{ customerId: 21, first_name: 'Anna' }, { id: 21, first_name: 'Jens' }],
+      [{ customerId: 21, first_name: 'Anna' }, { id: 21 }],
+      [{ customerId: 21, billing: { city: 'Aarhus' } }, { id: 21, billing: { city: 'Odense' } }],
+      [{ customerId: 21, shipping: { postcode: '8000' } }, { id: 21, billing: { postcode: '8000' } }],
+    ];
+    for (const [input, answer] of bad) {
+      const { gw } = shop({ 'PUT /customers/21': answer });
+      expect((await call(gw, 'update_customer', input)).isError, JSON.stringify([input, answer])).toBe(true);
+    }
   });
 });

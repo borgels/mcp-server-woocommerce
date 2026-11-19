@@ -48,7 +48,7 @@
   "author": "",
   "license": "Apache-2.0",
   "engines": {
-    "node": ">=22"
+    "node": ">=22.19.0"
   },
   "bugs": {
     "url": "https://github.com/borgels/mcp-server-woocommerce/issues"

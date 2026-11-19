@@ -478,12 +478,42 @@ export async function createDraftProduct(client: UpstreamClient, input: Json): P
   return productRow(created);
 }
 
-/** Change the fields given on a product; fields left out stay as they are. */
+const PRICE_FIELDS = new Set(['regular_price', 'sale_price']);
+
+/**
+ * Whether the answer carries every value that was sent, field by field (in
+ * the billing and shipping addresses too). Prices are compared as amounts
+ * ("49" is "49.00"), an empty price as empty, texts without surrounding
+ * space. A field that is missing or has another value means the change is
+ * not confirmed.
+ */
+function confirms(answer: unknown, sent: Json): boolean {
+  if (typeof answer !== 'object' || answer === null || Array.isArray(answer)) return false;
+  const record = answer as Json;
+  return Object.entries(sent).every(([field, value]) => {
+    const got = record[field];
+    if (typeof value === 'object' && value !== null && !Array.isArray(value)) return confirms(got, value as Json);
+    if (PRICE_FIELDS.has(field)) {
+      if (value === '') return got === '';
+      const asked = money(value);
+      const answered = money(got);
+      return asked !== undefined && answered !== undefined && Math.abs(asked - answered) < 0.005;
+    }
+    if (typeof value === 'string') return typeof got === 'string' && got.trim() === value.trim();
+    return got === value;
+  });
+}
+
+/**
+ * Change the fields given on a product; fields left out stay as they are.
+ * The answer must be the product with every value sent.
+ */
 export async function updateProduct(client: UpstreamClient, input: Json & { productId: number }): Promise<Json> {
-  const body = nestedFailuresAsStatus(
-    await client.put(idPath('products', input.productId, 'productId'), given(input, [...PRODUCT_WRITABLE, 'status'])),
-  );
-  return productRow(parse(product, body, input.productId));
+  const changes = given(input, [...PRODUCT_WRITABLE, 'status']);
+  const body = nestedFailuresAsStatus(await client.put(idPath('products', input.productId, 'productId'), changes));
+  const updated = parse(product, body, input.productId);
+  if (!confirms(updated, changes)) throw new UnexpectedAnswerError();
+  return productRow(updated);
 }
 
 // ---------------------------------------------------------------------------
@@ -512,7 +542,8 @@ export async function getCustomer(client: UpstreamClient, input: { customerId: n
 
 /**
  * Change a customer's name and addresses. The login e-mail, the billing
- * e-mail, the password and the role are never sent.
+ * e-mail, the password and the role are never sent. The answer must be the
+ * customer with every value sent.
  */
 export async function updateCustomer(client: UpstreamClient, input: Json & { customerId: number }): Promise<Json> {
   const changes: Json = given(input, ['first_name', 'last_name']);
@@ -522,7 +553,10 @@ export async function updateCustomer(client: UpstreamClient, input: Json & { cus
   if (billingInput) changes.billing = given(billingInput, [...ADDRESS_FIELDS, 'phone']);
   if (shippingInput) changes.shipping = given(shippingInput, ADDRESS_FIELDS);
   const body = nestedFailuresAsStatus(await client.put(idPath('customers', input.customerId, 'customerId'), changes));
-  return parse(customer, body, input.customerId);
+  const updated = parse(customer, body, input.customerId);
+  // The answer must be the customer with every value sent, in the addresses too.
+  if (!confirms(updated, changes)) throw new UnexpectedAnswerError();
+  return updated;
 }
 
 // ---------------------------------------------------------------------------

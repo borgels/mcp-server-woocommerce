@@ -44,6 +44,8 @@ API v3 documentation (https://woocommerce.github.io/woocommerce-rest-api-docs/).
   (`policy.pseudonymKey`, which is redacted like the shop's key). A write is
   reported as done only when the answer confirms it: a private note, the
   refund amount asked for with no money moved by the payment gateway, a
-  draft product.
+  draft product, a product or customer update with every value sent. The
+  pseudonym key is at least 32 characters or bytes, admitted like the
+  shop's key, and known to the error guard before anything is validated.
 - Not yet run against a live WooCommerce shop: the tests use answers shaped
   as the documentation shows them.

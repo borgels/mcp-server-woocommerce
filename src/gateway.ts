@@ -300,18 +300,33 @@ function requiredSecret(options: Partial<WooCommerceGatewayOptions> | undefined,
  */
 export function createWooCommerceGateway(options: WooCommerceGatewayOptions) {
   const given = options as Partial<WooCommerceGatewayOptions> | undefined;
-  // What the host gave, admitted or not: every error is masked against it.
-  const secrets = SECRET_OPTIONS.flatMap(name => {
-    const value: unknown = given?.[name];
-    return typeof value === 'string' ? [value, value.trim()] : [];
-  });
-  let guard: SecretRedactor | undefined;
+  // The host's pseudonym key, in every form it could be written, read before anything else can fail.
+  const pseudonymForms = keyForms(given?.policy?.pseudonymKey);
+  // What the host gave, admitted or not: every error is masked against it, the pseudonym key included.
+  const secrets = [
+    ...SECRET_OPTIONS.flatMap(name => {
+      const value: unknown = given?.[name];
+      return typeof value === 'string' ? [value, value.trim()] : [];
+    }),
+    ...pseudonymForms,
+  ];
+  // Every secret is known to the guard before any validation that can throw.
+  let guard: SecretRedactor | undefined = new SecretRedactor();
+  for (const form of pseudonymForms) guard.addSecret(form);
   try {
+    // The pseudonym key is admitted like the shop's key: as text, printable and sharing no piece with any text of
+    // ours, so no fixed text (a fallback, an error, the tool list) can carry a piece of it; as bytes, every form
+    // of it that is printable text (the bytes read as text, hex, base64) the same way.
+    const pseudonymKey: unknown = given?.policy?.pseudonymKey;
+    const refused =
+      typeof pseudonymKey === 'string'
+        ? !admitsKey(pseudonymKey)
+        : pseudonymForms.some(form => /^[ -~]+$/.test(form) && !admitsKey(form));
+    if (refused) throw new ConfigError(PSEUDONYM_KEY_REFUSED);
     const admitted = Object.fromEntries(SECRET_OPTIONS.map(name => [name, requiredSecret(given, name)])) as Record<
       SecretOption,
       string
     >;
-    guard = new SecretRedactor();
     for (const name of SECRET_OPTIONS) guard.addSecret(admitted[name]);
     guard.addSecret(Buffer.from(`${admitted.consumerKey}:${admitted.consumerSecret}`, 'utf8').toString('base64'));
     // The fixed outputs of the sink check (src/fallbacks.ts) must hold no piece of a key.
@@ -343,16 +358,22 @@ export function createWooCommerceGateway(options: WooCommerceGatewayOptions) {
   }
 }
 
+const PSEUDONYM_KEY_REFUSED =
+  'policy.pseudonymKey was refused: use at least 32 random printable characters (for example 32 random bytes as hex) or at least 32 random bytes.';
+
+/** A key given as text or bytes, in every form it could be written: as given, or as the bytes read or encoded. */
+function keyForms(key: unknown): string[] {
+  if (typeof key === 'string') return key === '' ? [] : [...new Set([key, key.trim()])];
+  if (key instanceof Uint8Array) {
+    const bytes = Buffer.from(key);
+    return [...new Set(['utf8', 'latin1', 'hex', 'base64', 'base64url'].map(form => bytes.toString(form as BufferEncoding)))];
+  }
+  return [];
+}
+
 /** Register a key given as text or bytes, in every form it could be written. */
 function addKeyMaterial(redactor: SecretRedactor, key: string | Uint8Array): void {
-  if (typeof key === 'string') {
-    redactor.addSecret(key);
-    return;
-  }
-  const bytes = Buffer.from(key);
-  for (const form of [bytes.toString('utf8'), bytes.toString('latin1'), bytes.toString('hex'), bytes.toString('base64'), bytes.toString('base64url')]) {
-    redactor.addSecret(form);
-  }
+  for (const form of keyForms(key)) redactor.addSecret(form);
 }
 
 function buildGateway(options: WooCommerceGatewayOptions, secrets: Record<SecretOption, string>) {
