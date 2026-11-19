@@ -40,7 +40,10 @@ API v3 documentation (https://woocommerce.github.io/woocommerce-rest-api-docs/).
   address checked (DNS rebinding); addresses are classified by value
   (ipaddr.js), embedded IPv4 included. Answers are parsed with a schema per
   resource, sub-objects and lists included; a record must have the id asked
-  for. The audit keeps the caller only as a pseudonym (`policy.pseudonymKey`)
-  and a request id only when it is an opaque token.
+  for. The audit keeps the caller and the request id only as pseudonyms
+  (`policy.pseudonymKey`, which is redacted like the shop's key). A write is
+  reported as done only when the answer confirms it: a private note, the
+  refund amount asked for with no money moved by the payment gateway, a
+  draft product.
 - Not yet run against a live WooCommerce shop: the tests use answers shaped
   as the documentation shows them.

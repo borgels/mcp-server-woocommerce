@@ -30,7 +30,7 @@ Writes (off unless `WOOCOMMERCE_ENABLE_WRITES=true`, or `enableWrites` in a host
 | Tool | What it does |
 |---|---|
 | `woocommerce_update_order_status` | Move an order to `processing`, `on-hold`, `completed` or `cancelled`. Reads it first; refuses the same status, or an order that is refunded, failed or in the trash. WooCommerce may e-mail the customer as the shop's own e-mail settings say. |
-| `woocommerce_add_order_note` | A private note on an order. `customer_note` is always `false`, so the customer is never notified. |
+| `woocommerce_add_order_note` | A private note on an order. `customer_note` is always `false`, so the customer is never notified; an answer that does not say `false` is reported as a failure. |
 | `woocommerce_record_refund` | Record a refund on an order **in the shop only**: `api_refund` is always `false` (WooCommerce's documented default is `true`, which asks the payment gateway to pay the money back) and `api_restock` always `false`. A person refunds the money in the payment provider. Reads the order first; refuses an order that is not processing, on-hold or completed, another currency, an order without its refunds list, or an amount above the total less earlier refunds. Refunds of one order run one at a time per shop in this process, whichever key the call came through. Marked `requiresConfirmation` for hosts. |
 | `woocommerce_create_draft_product` | A simple product, always as a draft (the documented default is `publish`). |
 | `woocommerce_update_product` | Change the fields given on a product: name, SKU, prices, descriptions, stock, status. Variations are not changed. |
@@ -217,7 +217,7 @@ them, and refuses one that shares a piece of 6 characters with a string
 literal in `src/` (`src/fixed-corpus.generated.ts`, kept up to date by a
 test). The refusal is a fixed text that never repeats the key.
 
-**Call context in the audit.** The `caller` a host passes is never logged in clear: it becomes a pseudonym (HMAC-SHA-256 with `policy.pseudonymKey`, else SHA-256). A `requestId` is kept only when it is an opaque token (letters, digits, `.`, `_`, `:`, `-`, at most 128 characters); anything else is replaced by a new id.
+**Call context in the audit.** The `caller` a host passes is never logged in clear: it becomes a pseudonym (HMAC-SHA-256 with `policy.pseudonymKey`, else SHA-256). Nor is a `requestId`: any text can hold a name, a phone number or an address, so the audit keeps its pseudonym the same way, which still ties the lines of one call together for a host that knows the key; without one the audit makes its own id. The pseudonym key is a secret of the instance like the shop's key: it is redacted from results, audit records and errors.
 
 **Rejected calls.** A call refused before it runs (an unknown tool or
 invalid input) is audited with a fixed code (`unknown_tool`,

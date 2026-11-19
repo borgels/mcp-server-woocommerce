@@ -6,7 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { UpstreamClient } from '../src/woocommerce/client.js';
 import { createServer, getDefaultClient } from '../src/server.js';
 import { createWooCommerceGateway, wooCommerceGatewayTools } from '../src/gateway.js';
-import { WOOCOMMERCE_TOOLS, executeTool, validateStartupConfig } from '../src/tools/woocommerce.js';
+import { WOOCOMMERCE_TOOLS, executeTool, validateStartupConfig, pseudonym } from '../src/tools/woocommerce.js';
 import { BASE, auditLines, connect, gateway, makeClient, texts, SECRET, SHOP } from './helpers.js';
 
 const originalEnv = { ...process.env };
@@ -27,7 +27,7 @@ afterEach(() => {
 });
 
 const item = { id: 12, first_name: 'First item' };
-const note = { id: 2, note: 'First item' };
+const note = { id: 2, note: 'First item', customer_note: false };
 
 describe('MCP tool surface', () => {
   it('registers every tool with matching annotations', async () => {
@@ -213,7 +213,7 @@ describe('gateway export', () => {
     expect(fetchImpl).toHaveBeenCalledTimes(1);
 
     const lines = auditLines(process.env.WOOCOMMERCE_AUDIT_LOG);
-    expect(lines[0]).toMatchObject({ requestId: 'req-1', caller: expect.stringMatching(/^sha256:[0-9a-f]{16}$/), action: 'start' });
+    expect(lines[0]).toMatchObject({ requestId: pseudonym('req-1'), caller: expect.stringMatching(/^sha256:[0-9a-f]{16}$/), action: 'start' });
     expect(JSON.stringify(lines)).not.toContain('user@vendor.test');
     expect(lines.map(line => line.action)).toEqual(['start', 'finish', 'rejected', 'rejected', 'policy_denied']);
   });

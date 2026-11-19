@@ -348,12 +348,18 @@ export async function updateOrderStatus(client: UpstreamClient, input: { orderId
   });
 }
 
-/** A private note: `customer_note` is always false, so the customer is never notified. */
+/**
+ * A private note: `customer_note` is always false, so the customer is never
+ * notified. The answer must say so: a note that comes back as a customer
+ * note, or without saying, is not reported as done.
+ */
 export async function addOrderNote(client: UpstreamClient, input: { orderId: number; note: string }): Promise<Json> {
   const body = nestedFailuresAsStatus(
     await client.post(`${idPath('orders', input.orderId, 'orderId')}/notes`, { note: input.note, customer_note: false }),
   );
-  return parse(orderNote, body);
+  const created = parse(orderNote, body);
+  if (created.customer_note !== false) throw new UnexpectedAnswerError();
+  return created;
 }
 
 /**
@@ -399,7 +405,12 @@ export async function recordRefund(
         api_restock: false,
       }),
     );
-    return parse(refund, body);
+    // The answer must be the refund asked for: the same amount, and no money moved by the payment gateway.
+    const created = parse(refund, body);
+    const answered = money(created.amount);
+    if (answered === undefined || Math.abs(answered - input.amount) > 0.005) throw new UnexpectedAnswerError();
+    if (created.refunded_payment !== false) throw new UnexpectedAnswerError();
+    return created;
   });
 }
 
@@ -457,13 +468,13 @@ function given(input: Json, fields: readonly string[]): Json {
   return out;
 }
 
-/** A new simple product, always as a draft (the documented default status is publish). The answer must be a draft. */
+/** A new simple product, always as a draft (the documented default status is publish). The answer must say draft. */
 export async function createDraftProduct(client: UpstreamClient, input: Json): Promise<Json> {
   const body = nestedFailuresAsStatus(
     await client.post('/products', { ...given(input, PRODUCT_WRITABLE), type: 'simple', status: 'draft' }),
   );
   const created = parse(product, body);
-  if (created.status !== undefined && created.status !== 'draft') throw new UnexpectedAnswerError();
+  if (created.status !== 'draft') throw new UnexpectedAnswerError();
   return productRow(created);
 }
 

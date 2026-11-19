@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { pseudonym } from '../src/tools/woocommerce.js';
 import { API_KEY_HEADER } from '../src/woocommerce/client.js';
 import { createWooCommerceGateway } from '../src/gateway.js';
 import { BASE, stubFetch, texts, SECRET, SHOP } from './helpers.js';
@@ -31,7 +32,7 @@ const LONG_KEY = `long-${'k'.repeat(250)}`;
 function routes() {
   return stubFetch({
     [`GET ${BASE}/customers/12`]: { body: { id: 12 } },
-    [`POST ${BASE}/orders/1/notes`]: { body: { id: 2 } },
+    [`POST ${BASE}/orders/1/notes`]: { body: { id: 2, customer_note: false } },
   });
 }
 
@@ -118,9 +119,9 @@ describe('call scopes', () => {
     // After resuming, A still cannot write: its own policy, not B's.
     expect((await a.callTool('add_order_note', { orderId: 1, note: 'n' }, { requestId: 'a2' })).isError).toBe(true);
 
-    expect(sinkA.filter(r => r.requestId === 'a').map(r => r.action)).toEqual(['start', 'finish']);
-    expect(new Set(sinkA.map(r => r.requestId))).toEqual(new Set(['a', 'a2']));
-    expect(new Set(sinkB.map(r => r.requestId))).toEqual(new Set(['b1', 'b2']));
+    expect(sinkA.filter(r => r.requestId === pseudonym('a')).map(r => r.action)).toEqual(['start', 'finish']);
+    expect(new Set(sinkA.map(r => r.requestId))).toEqual(new Set([pseudonym('a'), pseudonym('a2')]));
+    expect(new Set(sinkB.map(r => r.requestId))).toEqual(new Set([pseudonym('b1'), pseudonym('b2')]));
   });
 
   it('do not let a call from inside another instance inherit its policy or sink', async () => {
@@ -150,7 +151,7 @@ describe('call scopes', () => {
     expect(fromInside.isError).toBe(true);
     expect(texts(fromInside).join(' ')).toMatch(/WOOCOMMERCE_ENABLE_WRITES/);
     expect(fetchB).not.toHaveBeenCalled();
-    expect(sinkA.every(r => r.requestId === 'a')).toBe(true);
+    expect(sinkA.every(r => r.requestId === pseudonym('a'))).toBe(true);
   });
 
   it('do not let an instance with a policy, called from inside one without, use the environment', async () => {
@@ -162,7 +163,7 @@ describe('call scopes', () => {
     let fromInside: { isError?: boolean } | undefined;
     const fetchA = (async () => {
       fromInside = await b.callTool('add_order_note', { orderId: 1, note: 'n' });
-      return json({ id: 2 });
+      return json({ id: 2, customer_note: false });
     }) as unknown as typeof fetch;
     const a = createWooCommerceGateway({ consumerKey: KEY_A, consumerSecret: SECRET, shopUrl: SHOP, fetchImpl: fetchA });
     expect((await a.callTool('add_order_note', { orderId: 1, note: 'n' })).isError).toBeUndefined();

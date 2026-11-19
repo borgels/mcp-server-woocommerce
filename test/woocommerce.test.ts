@@ -204,7 +204,12 @@ describe('writes', () => {
 
   const refundRoutes = (order: Record<string, unknown>) => ({
     'GET /orders/727': { ...ORDER, ...order },
-    'POST /orders/727/refunds': { id: 9, amount: '50.00', reason: '', refunded_payment: false },
+    'POST /orders/727/refunds': (_url: URL, init: RequestInit) => ({
+      id: 9,
+      amount: (JSON.parse(String(init.body)) as { amount: string }).amount,
+      reason: '',
+      refunded_payment: false,
+    }),
   });
 
   it('records a refund in the shop without asking the payment gateway to pay it back, and without restocking', async () => {
@@ -266,7 +271,7 @@ describe('writes', () => {
       'POST /orders/727/refunds': (_url: URL, init: RequestInit) => {
         posts.push(init.body);
         refunded += 100;
-        return { id: posts.length, amount: '100.00' };
+        return { id: posts.length, amount: '100.00', refunded_payment: false };
       },
     };
     const one = shop(routes, 'ck_one_aaaa-bbbb-cccc');
@@ -436,7 +441,7 @@ describe('after review 1', () => {
     expect(text).not.toMatch(/plugin|meta_data/);
   });
 
-  it('keeps no name or address of the caller in the audit, and replaces a request id that is not an opaque token', async () => {
+  it('keeps no name or address of the caller or the request id in the audit', async () => {
     const records: Array<Record<string, unknown>> = [];
     const gw = createWooCommerceGateway({
       consumerKey: KEY,
@@ -451,10 +456,115 @@ describe('after review 1', () => {
     expect(text).not.toMatch(/jens|Jensen|Aarhus/i);
     expect(records[0]?.caller).toMatch(/^hmac:[0-9a-f]{16}$/);
     expect(records[0]?.caller).toBe(records.at(-1)?.caller);
-    expect(records[0]?.requestId).toMatch(/^[0-9a-f-]{36}$/);
-    expect(records.at(-1)?.requestId).toBe('req-42');
+    expect(records[0]?.requestId).toMatch(/^hmac:[0-9a-f]{16}$/);
+    expect(records.at(-1)?.requestId).toMatch(/^hmac:[0-9a-f]{16}$/);
+    expect(text).not.toContain('req-42');
     expect(() =>
       createWooCommerceGateway({ consumerKey: KEY, consumerSecret: SECRET, shopUrl: SHOP, policy: { pseudonymKey: 'short' } }),
     ).toThrow(/pseudonymKey/);
+  });
+});
+
+describe('after review 2', () => {
+  const PSEUDONYM_KEY = 'host-pseudonym-key-0002';
+
+  it('never keeps a request id from the host in clear, whatever characters it uses', async () => {
+    const records: Array<Record<string, unknown>> = [];
+    const gw = createWooCommerceGateway({
+      consumerKey: KEY,
+      consumerSecret: SECRET,
+      shopUrl: SHOP,
+      fetchImpl: (async () => Response.json({ id: 21 })) as typeof fetch,
+      policy: { audit: record => void records.push({ ...record }), pseudonymKey: PSEUDONYM_KEY },
+    });
+    // A name with a hyphen, a phone number, a private address and an internal host name: all within the old
+    // character filter. Made up for the test.
+    const given = ['Anne-Marie.Hansen', '+4512345678', '10.0.0.5', 'intra-01.corp.example:8443'];
+    for (const requestId of given) await gw.callTool('get_customer', { customerId: 21 }, { requestId });
+    await gw.callTool('get_customer', { customerId: 21 });
+    const text = JSON.stringify(records);
+    for (const value of given) expect(text).not.toContain(value);
+    expect(text).not.toMatch(/Anne|4512345678|10\.0\.0|corp/);
+    const ids = records.map(record => record.requestId);
+    for (const id of ids.slice(0, 8)) expect(id).toMatch(/^hmac:[0-9a-f]{16}$/);
+    // The lines of one call share their id; another call does not.
+    expect(ids[0]).toBe(ids[1]);
+    expect(ids[0]).not.toBe(ids[2]);
+    // Without a request id the audit makes its own.
+    expect(ids.at(-1)).toMatch(/^[0-9a-f-]{36}$/);
+  });
+
+  it('keeps the pseudonym key out of results, audit records and errors', async () => {
+    const records: Array<Record<string, unknown>> = [];
+    const gw = createWooCommerceGateway({
+      consumerKey: KEY,
+      consumerSecret: SECRET,
+      shopUrl: SHOP,
+      maxAttempts: 1,
+      fetchImpl: (async (input: string | URL | Request) =>
+        String(input).includes('/customers/21')
+          ? Response.json({ id: 21, first_name: `Navn ${PSEUDONYM_KEY}` })
+          : Response.json({ code: 'x', message: `Fejl ${PSEUDONYM_KEY}` }, { status: 400 })) as typeof fetch,
+      policy: { audit: record => void records.push({ ...record }), pseudonymKey: PSEUDONYM_KEY },
+    });
+    const results = [await gw.callTool('get_customer', { customerId: 21 }), await gw.callTool('get_customer', { customerId: 22 })];
+    expect(results[0]?.isError).toBeUndefined();
+    expect(results[1]?.isError).toBe(true);
+    const text = JSON.stringify([results, records]);
+    expect(text).not.toContain(PSEUDONYM_KEY);
+    expect(text).not.toContain(PSEUDONYM_KEY.slice(4, 16));
+  });
+
+  it('keeps a pseudonym key given as bytes out of results', async () => {
+    const bytes = new TextEncoder().encode(PSEUDONYM_KEY);
+    const gw = createWooCommerceGateway({
+      consumerKey: KEY,
+      consumerSecret: SECRET,
+      shopUrl: SHOP,
+      maxAttempts: 1,
+      fetchImpl: (async () =>
+        Response.json({ id: 21, first_name: PSEUDONYM_KEY, last_name: Buffer.from(bytes).toString('hex') })) as typeof fetch,
+      policy: { pseudonymKey: bytes },
+    });
+    const text = JSON.stringify(await gw.callTool('get_customer', { customerId: 21 }));
+    expect(text).not.toContain(PSEUDONYM_KEY);
+    expect(text).not.toContain(Buffer.from(bytes).toString('hex'));
+  });
+
+  it('reports a note as added only when the answer says it is private', async () => {
+    for (const answer of [
+      { id: 5, note: 'x', customer_note: true },
+      { id: 5, note: 'x' },
+    ]) {
+      const { gw } = shop({ 'POST /orders/727/notes': answer });
+      expect((await call(gw, 'add_order_note', { orderId: 727, note: 'x' })).isError, JSON.stringify(answer)).toBe(true);
+    }
+  });
+
+  it('reports a refund as recorded only with the amount asked for and no money moved', async () => {
+    for (const answer of [
+      { id: 9, amount: '60.00', refunded_payment: false },
+      { id: 9, amount: '50.00', refunded_payment: true },
+      { id: 9, amount: '50.00' },
+      { id: 9, refunded_payment: false },
+    ]) {
+      const { gw } = shop({ 'GET /orders/727': ORDER, 'POST /orders/727/refunds': answer });
+      const result = await call(gw, 'record_refund', { orderId: 727, amount: 50, currency: 'DKK' });
+      expect(result.isError, JSON.stringify(answer)).toBe(true);
+    }
+    const { gw } = shop({ 'GET /orders/727': ORDER, 'POST /orders/727/refunds': { id: 9, amount: '50.00', refunded_payment: false } });
+    expect((await call(gw, 'record_refund', { orderId: 727, amount: 50, currency: 'DKK' })).isError).toBeUndefined();
+  });
+
+  it('reports a product as created only when the answer says draft', async () => {
+    for (const answer of [{ id: 31, name: 'Kop' }, { id: 31, name: 'Kop', status: 'publish' }]) {
+      const { gw } = shop({ 'POST /products': answer });
+      expect((await call(gw, 'create_draft_product', { name: 'Kop' })).isError, JSON.stringify(answer)).toBe(true);
+    }
+  });
+
+  it('keeps a status with a hyphen in the change resolution', () => {
+    const resolved = resolveWooCommerceChange('update_order_status', { orderId: 727, status: 'on-hold' });
+    expect(resolved.ok && resolved.change.values).toEqual({ orderId: 727, status: 'on-hold' });
   });
 });

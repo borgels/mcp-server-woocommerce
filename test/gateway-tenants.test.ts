@@ -6,7 +6,7 @@ import { runInNewContext } from 'node:vm';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { API_KEY_HEADER, WooCommerceClient } from '../src/woocommerce/client.js';
 import { createWooCommerceGateway, wooCommerceGatewayTools, wooCommerceToolCatalog, type GatewayJsonObject } from '../src/gateway.js';
-import { WOOCOMMERCE_TOOLS } from '../src/tools/woocommerce.js';
+import { WOOCOMMERCE_TOOLS, pseudonym } from '../src/tools/woocommerce.js';
 import { BASE, auditLines, connect, stubFetch, texts, SECRET, SHOP } from './helpers.js';
 
 const originalEnv = { ...process.env };
@@ -141,7 +141,7 @@ describe('per-instance redaction', () => {
     await b.callTool('get_customer', { customerId: 12 }, { requestId: 'b' });
 
     const errors = auditLines(process.env.WOOCOMMERCE_AUDIT_LOG).filter(line => line.action === 'error');
-    expect(errors.map(line => line.requestId)).toEqual(['a', 'b']);
+    expect(errors.map(line => line.requestId)).toEqual([pseudonym('a'), pseudonym('b')]);
     const log = JSON.stringify(errors);
     expect(log).not.toContain(KEY_A);
     expect(log).not.toContain(KEY_B);
@@ -214,6 +214,11 @@ async function catalogFetch(input: string | URL | Request, init?: RequestInit): 
   if (method === 'GET' && /\/(products|customers|notes|refunds)$/.test(path)) return Response.json([{ id: 1 }]);
   const recordId = /\/(\d+)$/.exec(path)?.[1];
   if (method === 'POST' && path.endsWith('/products')) return Response.json({ id: 1, status: 'draft' });
+  if (method === 'POST' && path.endsWith('/notes')) return Response.json({ id: 1, customer_note: false });
+  if (method === 'POST' && path.endsWith('/refunds')) {
+    const { amount } = JSON.parse(String(init?.body)) as { amount: string };
+    return Response.json({ id: 1, amount, refunded_payment: false });
+  }
   return Response.json({ id: recordId ? Number(recordId) : 1 });
 }
 

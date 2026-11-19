@@ -134,7 +134,7 @@ describe('round 5 of the threat model, through callTool', () => {
       shopUrl: SHOP,
       maxAttempts: 1,
       fetchImpl: async (_input, init) =>
-        init?.method === 'POST' ? json({ ...body, id: 2, note: 'ok' }, 201) : json({ ...body, id: 11, first_name: 'ok' }),
+        init?.method === 'POST' ? json({ ...body, id: 2, note: 'ok', customer_note: false }, 201) : json({ ...body, id: 11, first_name: 'ok' }),
       policy: { enableWrites: true },
     });
     for (const result of [await gw.callTool('get_customer', { customerId: 11 }), await gw.callTool('add_order_note', { orderId: 1, note: 'n' })]) {
