@@ -1,0 +1,52 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.borgels/mcp-server-example",
+  "title": "Example",
+  "description": "Unofficial MCP server for the Example API.",
+  "repository": {
+    "url": "https://github.com/borgels/mcp-server-example",
+    "source": "github"
+  },
+  "version": "0.1.1",
+  "packages": [
+    {
+      "registryType": "npm",
+      "registryBaseUrl": "https://registry.npmjs.org",
+      "identifier": "mcp-server-example",
+      "version": "0.1.1",
+      "runtimeHint": "npx",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "EXAMPLE_API_KEY",
+          "description": "API key for the Example API.",
+          "isRequired": true,
+          "isSecret": true
+        },
+        {
+          "name": "EXAMPLE_BASE_URL",
+          "description": "Base URL of the Example API.",
+          "isRequired": true,
+          "placeholder": "https://api.vendor.test/v1"
+        },
+        {
+          "name": "EXAMPLE_ENABLE_WRITES",
+          "description": "Enable the write tools.",
+          "format": "boolean",
+          "default": "false"
+        },
+        {
+          "name": "EXAMPLE_DISABLED_TOOLS",
+          "description": "Comma-separated tool names to disable."
+        },
+        {
+          "name": "EXAMPLE_AUDIT_LOG",
+          "description": "Path of the JSONL audit log. Write tools refuse to run if it cannot be written.",
+          "format": "filepath"
+        }
+      ]
+    }
+  ]
+}

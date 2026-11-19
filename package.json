@@ -1,0 +1,72 @@
+{
+  "name": "mcp-server-example",
+  "version": "0.1.1",
+  "mcpName": "io.github.borgels/mcp-server-example",
+  "description": "Unofficial MCP server for the Example API.",
+  "type": "module",
+  "main": "./dist/transports/stdio.js",
+  "exports": {
+    ".": "./dist/transports/stdio.js",
+    "./gateway": {
+      "types": "./dist/gateway.d.ts",
+      "default": "./dist/gateway.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md",
+    ".env.example"
+  ],
+  "bin": {
+    "mcp-server-example": "./dist/transports/stdio.js"
+  },
+  "scripts": {
+    "build": "tsup src/transports/stdio.ts src/transports/http.ts src/gateway.ts --format esm --dts --clean --sourcemap",
+    "dev": "tsx src/transports/stdio.ts",
+    "dev:http": "tsx src/transports/http.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "prepare": "npm run build",
+    "prepack": "npm run typecheck && npm test && npm run build"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/borgels/mcp-server-example.git"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "example"
+  ],
+  "author": "",
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=22"
+  },
+  "bugs": {
+    "url": "https://github.com/borgels/mcp-server-example/issues"
+  },
+  "homepage": "https://github.com/borgels/mcp-server-example#readme",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "zod": "^4.6.7"
+  },
+  "overrides": {
+    "ip-address": "^10.1.1",
+    "hono": "^4.13.19",
+    "@hono/node-server": "^2.1.8",
+    "fast-uri": "^3.1.9",
+    "qs": "^6.17.1",
+    "body-parser": "^2.4.0"
+  },
+  "devDependencies": {
+    "@types/node": "^25.9.9",
+    "ajv": "^8.20.0",
+    "tsup": "^8.5.1",
+    "tsx": "^4.23.15",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.12"
+  }
+}
