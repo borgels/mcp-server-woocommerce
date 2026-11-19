@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { validateStartupConfig } from '../tools/example.js';
+import { validateStartupConfig } from '../tools/woocommerce.js';
 import { createServer, getDefaultClient } from '../server.js';
 
 async function main(): Promise<void> {
@@ -9,7 +9,7 @@ async function main(): Promise<void> {
     getDefaultClient();
     validateStartupConfig();
   } catch (error) {
-    console.error(`Example MCP server not started: ${error instanceof Error ? error.message : String(error)}`);
+    console.error(`WooCommerce MCP server not started: ${error instanceof Error ? error.message : String(error)}`);
     process.exit(1);
   }
 

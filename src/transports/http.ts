@@ -1,5 +1,5 @@
 import { ConfigError } from '../config-env.js';
-import { validateStartupConfig } from '../tools/example.js';
+import { validateStartupConfig } from '../tools/woocommerce.js';
 import { getDefaultClient } from '../server.js';
 import { configWarnings, getHttpConfig, type HttpConfig } from './http-helpers.js';
 import { startHttpServer } from './http-server.js';
@@ -10,7 +10,7 @@ async function main(): Promise<void> {
     config = getHttpConfig();
   } catch (error) {
     if (error instanceof ConfigError) {
-      console.error(`Example MCP HTTP server not started: ${error.message}`);
+      console.error(`WooCommerce MCP HTTP server not started: ${error.message}`);
       process.exit(1);
     }
     throw error;
@@ -22,7 +22,7 @@ async function main(): Promise<void> {
     getDefaultClient();
     validateStartupConfig();
   } catch (error) {
-    console.error(`Example MCP HTTP server not started: ${error instanceof Error ? error.message : String(error)}`);
+    console.error(`WooCommerce MCP HTTP server not started: ${error instanceof Error ? error.message : String(error)}`);
     process.exit(1);
   }
 
@@ -31,7 +31,7 @@ async function main(): Promise<void> {
   }
 
   const running = await startHttpServer(config);
-  console.error(`Example MCP HTTP server listening on http://${config.host}:${running.port}/mcp`);
+  console.error(`WooCommerce MCP HTTP server listening on http://${config.host}:${running.port}/mcp`);
 
   const shutdown = (signal: string) => {
     console.error(`Received ${signal}, shutting down`);

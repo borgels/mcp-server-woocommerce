@@ -1,24 +1,41 @@
 import { ConfigError, readEnvBoolean, readEnvInteger, readEnvString, type Env } from '../config-env.js';
-import { ExampleHttpError, describeUrl, parseRetryAfterMs, SecretRedactor } from '../errors.js';
+import { WooCommerceHttpError, describeUrl, parseRetryAfterMs, SecretRedactor } from '../errors.js';
+import { createHash } from 'node:crypto';
 import { USER_AGENT } from '../version.js';
 
-export interface ExampleClientOptions {
-  /** API key. When omitted, read from EXAMPLE_API_KEY in `credentialEnv`. */
-  apiKey?: string;
-  /** API base URL. When omitted, read from EXAMPLE_BASE_URL in `credentialEnv`. */
-  baseUrl?: string;
+
+export interface WooCommerceClientOptions {
+  /** REST API consumer key (ck_...). When omitted, read from WOOCOMMERCE_CONSUMER_KEY in `credentialEnv`. */
+  consumerKey?: string;
+  /** REST API consumer secret (cs_...). When omitted, read from WOOCOMMERCE_CONSUMER_SECRET in `credentialEnv`. */
+  consumerSecret?: string;
+  /** The shop's address, e.g. https://shop.example.dk. When omitted, read from WOOCOMMERCE_SHOP_URL in `credentialEnv`. */
+  shopUrl?: string;
   /**
-   * Where omitted credentials (apiKey, baseUrl) are read from. Defaults to
-   * process.env for the standalone server. The gateway passes `{}`, so an
-   * embedded instance only ever uses the credentials it was given.
+   * Where omitted credentials (consumerKey, consumerSecret, shopUrl) are read
+   * from. Defaults to process.env for the standalone server. The gateway
+   * passes `{}`, so an embedded instance only ever uses what it was given.
    */
   credentialEnv?: Env;
+  /**
+   * Allow a shop on a loopback or private address, or over http on loopback
+   * (env WOOCOMMERCE_ALLOW_PRIVATE_HOST). For local development only; never
+   * under a gateway host policy.
+   */
+  allowPrivateHost?: boolean;
+  /**
+   * Resolves the shop's host name to addresses before each request, so a
+   * name that points to a private address is refused. Default: the
+   * system resolver (node:dns). When `fetchImpl` is given and this is not,
+   * no lookup is made: the host that supplies the fetch decides where it goes.
+   */
+  resolveHost?: (hostname: string) => Promise<readonly string[]>;
   fetchImpl?: typeof fetch;
-  /** Per-attempt timeout covering headers and body (default 30 s, env EXAMPLE_TIMEOUT_MS). */
+  /** Per-attempt timeout covering headers and body (default 30 s, env WOOCOMMERCE_TIMEOUT_MS). */
   timeoutMs?: number;
-  /** Maximum number of concurrent upstream requests from this client (default 4, env EXAMPLE_MAX_CONCURRENCY). */
+  /** Maximum number of concurrent upstream requests from this client (default 4, env WOOCOMMERCE_MAX_CONCURRENCY). */
   maxConcurrency?: number;
-  /** Largest successful response body read, in bytes (default 10 MB, env EXAMPLE_MAX_RESPONSE_BYTES). */
+  /** Largest successful response body read, in bytes (default 10 MB, env WOOCOMMERCE_MAX_RESPONSE_BYTES). */
   maxResponseBytes?: number;
   /** Total attempts for idempotent GETs on 429/502/503/504 and transient network errors (default 3). */
   maxAttempts?: number;
@@ -30,25 +47,45 @@ export interface ExampleClientOptions {
    * the response is returned to the caller instead.
    */
   retryBudgetMs?: number;
-  /** Allow a base URL outside UPSTREAM_HOST_SUFFIXES (env EXAMPLE_ALLOW_CUSTOM_BASE_URL=true). */
-  allowCustomBaseUrl?: boolean;
   /** Injectable for tests. */
   sleep?: (ms: number) => Promise<void>;
 }
 
 export type QueryValue = string | number | boolean | null | undefined;
 
-type HttpMethod = 'GET' | 'POST' | 'PATCH' | 'PUT' | 'DELETE';
+/** One page of a list and the totals from the X-WP-Total and X-WP-TotalPages headers (absent when not sent). */
+export interface Page<T> {
+  body: T;
+  total?: number;
+  totalPages?: number;
+}
 
-/** Header that carries the API key. Change it to match the upstream API; error text redaction follows it. */
-export const API_KEY_HEADER = 'X-API-Key';
+type HttpMethod = 'GET' | 'POST' | 'PUT';
 
 /**
- * Hosts the API key may be sent to (exact host or any subdomain), e.g.
- * ['api.vendor.com']. Empty: any https host. Loopback http is always allowed
- * for local mocks.
+ * The header that carries the credentials: HTTP Basic auth with the consumer
+ * key as user name and the consumer secret as password, as the WooCommerce
+ * REST API documentation describes for HTTPS ("Authentication over HTTPS").
+ * Error text redaction follows it.
  */
-export const UPSTREAM_HOST_SUFFIXES: readonly string[] = [];
+export const API_KEY_HEADER = 'Authorization';
+
+/** The REST API's path below the shop's address (WooCommerce 3.5 or later, pretty permalinks on). */
+export const API_PATH = '/wp-json/wc/v3';
+
+/**
+ * The only writes the client sends: method and path (relative to the API
+ * path). Anything else, a DELETE among them, is refused before it is sent,
+ * whatever a tool or a policy says. The client has no delete method at all.
+ */
+export const ALLOWED_WRITES: ReadonlyArray<{ method: 'POST' | 'PUT'; path: RegExp }> = [
+  { method: 'PUT', path: /^\/orders\/\d+$/ },
+  { method: 'POST', path: /^\/orders\/\d+\/notes$/ },
+  { method: 'POST', path: /^\/orders\/\d+\/refunds$/ },
+  { method: 'POST', path: /^\/products$/ },
+  { method: 'PUT', path: /^\/products\/\d+$/ },
+  { method: 'PUT', path: /^\/customers\/\d+$/ },
+];
 
 export const DEFAULT_MAX_RESPONSE_BYTES = 10 * 1024 * 1024;
 const MAX_RESPONSE_BYTES_LIMIT = 100 * 1024 * 1024;
@@ -102,8 +139,14 @@ const TRANSIENT_NETWORK_CODES = new Set([
  */
 export interface UpstreamClient {
   get<T>(path: string, query?: Record<string, QueryValue>): Promise<T>;
+  getPage<T>(path: string, query?: Record<string, QueryValue>): Promise<Page<T>>;
   post<T>(path: string, body?: unknown, query?: Record<string, QueryValue>): Promise<T>;
-  patch<T>(path: string, body?: unknown): Promise<T>;
+  put<T>(path: string, body?: unknown): Promise<T>;
+  /**
+   * The shop, for serialising writes to one order in this process: the same
+   * for every key of the shop, and holding no credential.
+   */
+  shopIdentity(): string;
 }
 
 /**
@@ -117,28 +160,35 @@ export function readOnlyClient(client: UpstreamClient, toolName: string): Upstre
   };
   return {
     get: (path, query) => client.get(path, query),
+    getPage: (path, query) => client.getPage(path, query),
     post: refuse('POST'),
-    patch: refuse('PATCH'),
+    put: refuse('PUT'),
+    shopIdentity: () => client.shopIdentity(),
   };
 }
 
 /**
- * Client for the upstream API. Authenticates with a single API key header.
+ * Client for the upstream API. Authenticates with the consumer key and secret (HTTP Basic over HTTPS).
  *
  * Redirects are never followed, so the key cannot be forwarded to another
  * origin. Idempotent GETs are retried with backoff on throttling, gateway
  * errors and transient network failures; other methods are never retried.
- * A missing API key or base URL only fails when a request is made, so the
+ * Missing credentials or shop address only fail when a request is made, so the
  * tool list can be read without credentials.
  *
  * Each client owns a SecretRedactor holding its own key and key header;
  * errors raised by the client, and the audit and tool results of calls
  * made through it, are redacted with it.
  */
-export class ExampleClient implements UpstreamClient {
+export class WooCommerceClient implements UpstreamClient {
   readonly redactor: SecretRedactor;
-  private readonly apiKey?: string;
+  private readonly authorization?: string;
+  private readonly missing?: string;
+  /** The REST API base: the shop's address and API_PATH. */
   readonly baseUrl?: string;
+  private readonly hostname?: string;
+  private readonly allowPrivateHost: boolean;
+  private readonly resolveHost?: (hostname: string) => Promise<readonly string[]>;
   private readonly fetchImpl: typeof fetch;
   private readonly timeoutMs: number;
   private readonly maxResponseBytes: number;
@@ -148,30 +198,38 @@ export class ExampleClient implements UpstreamClient {
   private readonly semaphore: Semaphore;
   private readonly sleep: (ms: number) => Promise<void>;
 
-  constructor(options: ExampleClientOptions = {}) {
+  constructor(options: WooCommerceClientOptions = {}) {
     const credentialEnv = options.credentialEnv ?? process.env;
-    this.apiKey = options.apiKey ?? readEnvString('EXAMPLE_API_KEY', credentialEnv);
-    this.redactor = new SecretRedactor().addHeader(API_KEY_HEADER).addSecret(this.apiKey);
-    const baseUrl = options.baseUrl ?? readEnvString('EXAMPLE_BASE_URL', credentialEnv);
-    if (baseUrl !== undefined) {
-      this.baseUrl = trimTrailingSlash(baseUrl);
-      assertSafeBaseUrl(
-        this.baseUrl,
-        options.allowCustomBaseUrl ?? readEnvBoolean('EXAMPLE_ALLOW_CUSTOM_BASE_URL', false),
-      );
+    const consumerKey = options.consumerKey ?? readEnvString('WOOCOMMERCE_CONSUMER_KEY', credentialEnv);
+    const consumerSecret = options.consumerSecret ?? readEnvString('WOOCOMMERCE_CONSUMER_SECRET', credentialEnv);
+    this.redactor = new SecretRedactor().addHeader(API_KEY_HEADER).addSecret(consumerKey).addSecret(consumerSecret);
+    if (consumerKey && consumerSecret) {
+      const basic = Buffer.from(`${consumerKey}:${consumerSecret}`, 'utf8').toString('base64');
+      this.redactor.addSecret(basic);
+      this.authorization = `Basic ${basic}`;
+    } else {
+      this.missing = consumerKey ? 'WOOCOMMERCE_CONSUMER_SECRET' : 'WOOCOMMERCE_CONSUMER_KEY';
     }
+    this.allowPrivateHost = options.allowPrivateHost ?? readEnvBoolean('WOOCOMMERCE_ALLOW_PRIVATE_HOST', false);
+    const shopUrl = options.shopUrl ?? readEnvString('WOOCOMMERCE_SHOP_URL', credentialEnv);
+    if (shopUrl !== undefined) {
+      const shop = assertSafeShopUrl(trimTrailingSlash(shopUrl), this.allowPrivateHost);
+      this.hostname = shop.hostname;
+      this.baseUrl = `${trimTrailingSlash(`${shop.origin}${shop.pathname}`)}${API_PATH}`;
+    }
+    this.resolveHost = options.resolveHost ?? (options.fetchImpl ? undefined : systemResolve);
     this.fetchImpl = options.fetchImpl ?? fetch;
-    this.timeoutMs = intOption('timeoutMs', options.timeoutMs, 'EXAMPLE_TIMEOUT_MS', 30_000, 1, MAX_TIMER_MS);
+    this.timeoutMs = intOption('timeoutMs', options.timeoutMs, 'WOOCOMMERCE_TIMEOUT_MS', 30_000, 1, MAX_TIMER_MS);
     this.maxResponseBytes = intOption(
       'maxResponseBytes',
       options.maxResponseBytes,
-      'EXAMPLE_MAX_RESPONSE_BYTES',
+      'WOOCOMMERCE_MAX_RESPONSE_BYTES',
       DEFAULT_MAX_RESPONSE_BYTES,
       1,
       MAX_RESPONSE_BYTES_LIMIT,
     );
     this.semaphore = new Semaphore(
-      intOption('maxConcurrency', options.maxConcurrency, 'EXAMPLE_MAX_CONCURRENCY', 4, 1, 64),
+      intOption('maxConcurrency', options.maxConcurrency, 'WOOCOMMERCE_MAX_CONCURRENCY', 4, 1, 64),
     );
     this.maxAttempts = intOption('maxAttempts', options.maxAttempts, undefined, 3, 1, 10);
     this.retryBaseDelayMs = intOption('retryBaseDelayMs', options.retryBaseDelayMs, undefined, 500, 0, 60_000);
@@ -180,20 +238,37 @@ export class ExampleClient implements UpstreamClient {
   }
 
   async get<T>(path: string, query?: Record<string, QueryValue>): Promise<T> {
+    return (await this.request<T>('GET', this.buildUrl(path, query))).body;
+  }
+
+  /** A GET of one page of a list, with the totals WooCommerce sends in X-WP-Total and X-WP-TotalPages. */
+  async getPage<T>(path: string, query?: Record<string, QueryValue>): Promise<Page<T>> {
     return this.request<T>('GET', this.buildUrl(path, query));
   }
 
   async post<T>(path: string, body?: unknown, query?: Record<string, QueryValue>): Promise<T> {
-    return this.request<T>('POST', this.buildUrl(path, query), body);
+    return (await this.request<T>('POST', this.buildUrl(path, query), body)).body;
   }
 
-  async patch<T>(path: string, body?: unknown): Promise<T> {
-    return this.request<T>('PATCH', this.buildUrl(path), body);
+  /**
+   * The shop, independent of the key: its API address with the host in lower
+   * case and a leading "www." left out, hashed. Two connections with
+   * different keys to the same shop share it. See recordRefund.
+   */
+  shopIdentity(): string {
+    if (!this.baseUrl) return 'unconfigured';
+    const url = new URL(this.baseUrl);
+    const host = url.hostname.toLowerCase().replace(/^www\./, '');
+    return createHash('sha256').update(`${host}${url.port ? `:${url.port}` : ''}${url.pathname.replace(/\/+$/, '')}`).digest('hex').slice(0, 32);
+  }
+
+  async put<T>(path: string, body?: unknown): Promise<T> {
+    return (await this.request<T>('PUT', this.buildUrl(path), body)).body;
   }
 
   buildUrl(path: string, query?: Record<string, QueryValue>): string {
     if (!this.baseUrl) {
-      throw new Error('Missing EXAMPLE_BASE_URL. Set it in the MCP server environment.');
+      throw new Error('Missing WOOCOMMERCE_SHOP_URL. Set it in the MCP server environment.');
     }
     const normalizedPath = path.startsWith('/') ? path : `/${path}`;
     const url = new URL(`${this.baseUrl}${normalizedPath}`);
@@ -209,18 +284,40 @@ export class ExampleClient implements UpstreamClient {
   }
 
   private headers(): Record<string, string> {
-    if (!this.apiKey) {
-      throw new Error('Missing EXAMPLE_API_KEY. Set it in the MCP server environment.');
+    if (!this.authorization) {
+      throw new Error(`Missing ${this.missing ?? 'WOOCOMMERCE_CONSUMER_KEY'}. Set it in the MCP server environment.`);
     }
     return {
       Accept: 'application/json',
       'User-Agent': USER_AGENT,
-      [API_KEY_HEADER]: this.apiKey,
+      [API_KEY_HEADER]: this.authorization,
     };
   }
 
-  private async request<T>(method: HttpMethod, url: string, body?: unknown): Promise<T> {
+  /** Refuses, before anything is sent, a shop name that resolves to a loopback, private or link-local address. */
+  private async checkHost(): Promise<void> {
+    if (!this.resolveHost || this.allowPrivateHost || !this.hostname) return;
+    let addresses: readonly string[];
+    try {
+      addresses = await this.resolveHost(this.hostname);
+    } catch {
+      throw new Error('The shop address could not be resolved. Check the shop address.');
+    }
+    if (addresses.length === 0 || addresses.some(isPrivateAddress)) {
+      throw new Error('Refused: the shop address points to a private or local network address.');
+    }
+  }
+
+  private async request<T>(method: HttpMethod, url: string, body?: unknown): Promise<Page<T>> {
+    if (method !== 'GET') {
+      // The fixed list of writes: anything else is refused before the credentials are put in a header.
+      const path = new URL(url).pathname.slice(new URL(`${this.baseUrl}/`).pathname.length - 1);
+      if (!ALLOWED_WRITES.some(entry => entry.method === method && entry.path.test(path))) {
+        throw new Error(`Refused: ${method} to that path is not among the writes this server sends.`);
+      }
+    }
     const headers = this.headers();
+    await this.checkHost();
     const init: RequestInit = { method, headers };
     if (body !== undefined) {
       headers['Content-Type'] = 'application/json';
@@ -234,16 +331,19 @@ export class ExampleClient implements UpstreamClient {
       }
 
       if (!response.ok) {
-        // The body is the vendor's text: it is never read into an error, a result or an audit record.
+        // The body is the shop's text: it is never read into an error, a result or an audit record.
         await discardBody(response);
-        throw new ExampleHttpError({
+        throw new WooCommerceHttpError({
           status: response.status,
           url: describeUrl(url),
           retryAfter: response.headers.get('retry-after') ?? undefined,
         });
       }
 
-      return (await readResponseBody(response, this.maxResponseBytes)) as T;
+      const total = countHeader(response.headers.get('x-wp-total'));
+      const totalPages = countHeader(response.headers.get('x-wp-totalpages'));
+      const data = (await readResponseBody(response, this.maxResponseBytes)) as T;
+      return { body: data, total, totalPages };
     });
   }
 
@@ -325,12 +425,12 @@ export class ExampleClient implements UpstreamClient {
   // Our own words with the method only: the address is configuration and is not quoted.
   private transportError(method: HttpMethod, _url: string, error: unknown): Error {
     if (isTimeoutError(error)) {
-      return new Error(this.redactor.redact(`Example API request timed out after ${this.timeoutMs} ms (${method}).`));
+      return new Error(this.redactor.redact(`WooCommerce API request timed out after ${this.timeoutMs} ms (${method}).`));
     }
     // Only a system error code (ECONNREFUSED, ENOTFOUND, ...) from the cause, never its message.
     const code = (error instanceof Error ? (error.cause as { code?: unknown } | undefined)?.code : undefined) ?? undefined;
     const shown = typeof code === 'string' && SHOWN_NETWORK_CODES.has(code) ? ` (${code})` : '';
-    return new Error(this.redactor.redact(`Network error calling the Example API (${method})${shown}.`), { cause: error });
+    return new Error(this.redactor.redact(`Network error calling the WooCommerce API (${method})${shown}.`), { cause: error });
   }
 }
 
@@ -388,8 +488,8 @@ function isRedirect(status: number): boolean {
 /** The redirect's Location is the vendor's text and is never quoted; only the status and our own request. */
 function redirectRefusedMessage(response: Response, method: HttpMethod, _url: string): string {
   return (
-    `Example API responded with a redirect (HTTP ${response.status}) for ${method}; ` +
-    'redirects are not followed. Check EXAMPLE_BASE_URL.'
+    `WooCommerce API responded with a redirect (HTTP ${response.status}) for ${method}; ` +
+    'redirects are not followed. Check the shop address (WOOCOMMERCE_SHOP_URL): it must be the address the shop answers on.'
   );
 }
 
@@ -469,7 +569,7 @@ async function readResponseBody(response: Response, maxBytes: number): Promise<u
   const declared = Number(response.headers.get('content-length') ?? 0);
   if (Number.isFinite(declared) && declared > maxBytes) {
     await discardBody(response);
-    throw new Error(`Example API response of ${declared} bytes exceeds the ${maxBytes} byte limit (EXAMPLE_MAX_RESPONSE_BYTES).`);
+    throw new Error(`WooCommerce API response of ${declared} bytes exceeds the ${maxBytes} byte limit (WOOCOMMERCE_MAX_RESPONSE_BYTES).`);
   }
   let read: { bytes: Uint8Array; exceeded: boolean };
   try {
@@ -480,11 +580,11 @@ async function readResponseBody(response: Response, maxBytes: number): Promise<u
     if (isTimeoutError(error) || isTransientNetworkError(error)) {
       throw error;
     }
-    throw new Error('The Example API response could not be read.');
+    throw new Error('The WooCommerce API response could not be read.');
   }
   const { bytes, exceeded } = read;
   if (exceeded) {
-    throw new Error(`Example API response exceeds the ${maxBytes} byte limit (EXAMPLE_MAX_RESPONSE_BYTES).`);
+    throw new Error(`WooCommerce API response exceeds the ${maxBytes} byte limit (WOOCOMMERCE_MAX_RESPONSE_BYTES).`);
   }
   const text = new TextDecoder().decode(bytes);
   if (!text) {
@@ -509,43 +609,92 @@ function trimTrailingSlash(value: string): string {
   return value.slice(0, end);
 }
 
-function assertSafeBaseUrl(baseUrl: string, allowCustomHost: boolean): void {
+/** Host names that are never a public shop. */
+const LOCAL_SUFFIXES = ['.local', '.localhost', '.internal', '.lan', '.home.arpa', '.intranet', '.corp'];
+
+/**
+ * Checks the shop's address before anything is built from it: https, no
+ * credentials, query or fragment, and a public host name (not an IP address,
+ * not localhost, not a single label, not a local suffix). A shop on a
+ * loopback or private address is accepted only with allowPrivateHost, for
+ * local development. The address is never quoted: it is configuration.
+ */
+function assertSafeShopUrl(shopUrl: string, allowPrivateHost: boolean): URL {
   let parsed: URL;
   try {
-    parsed = new URL(baseUrl);
+    parsed = new URL(shopUrl);
   } catch {
-    throw new ConfigError('EXAMPLE_BASE_URL is not a valid URL.');
+    throw new ConfigError('WOOCOMMERCE_SHOP_URL is not a valid URL.');
   }
-
-  if (parsed.username || parsed.password || baseUrl.includes('?') || baseUrl.includes('#')) {
-    throw new ConfigError('EXAMPLE_BASE_URL must not contain credentials, a query string or a fragment.');
+  if (parsed.username || parsed.password || shopUrl.includes('?') || shopUrl.includes('#')) {
+    throw new ConfigError('WOOCOMMERCE_SHOP_URL must not contain credentials, a query string or a fragment.');
   }
-
-  if (isLocalHost(parsed.hostname) && (parsed.protocol === 'http:' || parsed.protocol === 'https:')) {
-    return;
+  if (allowPrivateHost) {
+    if (parsed.protocol === 'https:' || (parsed.protocol === 'http:' && isLocalHost(parsed.hostname))) return parsed;
+    throw new ConfigError('WOOCOMMERCE_SHOP_URL must use https:// (loopback http:// only for local development).');
   }
-
   if (parsed.protocol !== 'https:') {
-    throw new ConfigError(
-      // The scheme is not quoted: it is part of a configuration value.
-      'Refusing to send the API key over a scheme other than https://. Use https:// (loopback http:// is allowed for local mocks).',
-    );
+    // The scheme is not quoted: it is part of a configuration value.
+    throw new ConfigError('Refusing to send the API key over a scheme other than https://. The shop address must use https://.');
   }
-
   const host = parsed.hostname.toLowerCase();
   if (
-    UPSTREAM_HOST_SUFFIXES.length === 0 ||
-    allowCustomHost ||
-    UPSTREAM_HOST_SUFFIXES.some(suffix => host === suffix || host.endsWith(`.${suffix}`))
+    isLocalHost(host) ||
+    isIpLiteral(host) ||
+    !host.includes('.') ||
+    LOCAL_SUFFIXES.some(suffix => host.endsWith(suffix))
   ) {
-    return;
+    throw new ConfigError('Refusing that shop address: it must be a public host name, not an IP address or a local name.');
   }
+  return parsed;
+}
 
-  // The host is not quoted: it is a configuration value.
-  throw new ConfigError(
-    `Refusing to send the API key to that host: EXAMPLE_BASE_URL must be on ${UPSTREAM_HOST_SUFFIXES.join(', ')}. ` +
-      'Set EXAMPLE_ALLOW_CUSTOM_BASE_URL=true to allow another host.',
+function isIpLiteral(host: string): boolean {
+  return host.startsWith('[') || /^\d{1,3}(\.\d{1,3}){3}$/.test(host) || /^[0-9a-f:]+$/i.test(host) && host.includes(':');
+}
+
+/** Loopback, private, link-local, carrier-grade NAT, unspecified, multicast and the IPv6 equivalents. */
+export function isPrivateAddress(address: string): boolean {
+  const value = address.toLowerCase();
+  const mapped = value.startsWith('::ffff:') ? value.slice(7) : value;
+  const v4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(mapped);
+  if (v4) {
+    const [a, b] = [Number(v4[1]), Number(v4[2])];
+    return (
+      a === 0 ||
+      a === 10 ||
+      a === 127 ||
+      (a === 100 && b >= 64 && b <= 127) ||
+      (a === 169 && b === 254) ||
+      (a === 172 && b >= 16 && b <= 31) ||
+      (a === 192 && b === 168) ||
+      (a === 198 && (b === 18 || b === 19)) ||
+      a >= 224
+    );
+  }
+  return (
+    value === '::' ||
+    value === '::1' ||
+    value.startsWith('fc') ||
+    value.startsWith('fd') ||
+    value.startsWith('fe8') ||
+    value.startsWith('fe9') ||
+    value.startsWith('fea') ||
+    value.startsWith('feb') ||
+    value.startsWith('ff')
   );
+}
+
+/** The system resolver: every address the name has. */
+async function systemResolve(hostname: string): Promise<readonly string[]> {
+  const { lookup } = await import('node:dns/promises');
+  const answers = await lookup(hostname, { all: true, verbatim: true });
+  return answers.map(answer => answer.address);
+}
+
+/** A count from a header: a whole number of at most 9 digits, else undefined. Nothing else of a header is kept. */
+function countHeader(value: string | null): number | undefined {
+  return value !== null && /^\d{1,9}$/.test(value.trim()) ? Number(value.trim()) : undefined;
 }
 
 function isLocalHost(hostname: string): boolean {
