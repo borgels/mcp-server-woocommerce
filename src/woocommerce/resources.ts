@@ -321,8 +321,25 @@ export async function listOrderNotes(client: UpstreamClient, input: { orderId: n
   return { notes: parseList(orderNote, await get(client, `${idPath('orders', input.orderId, 'orderId')}/notes`, { type: input.type })) };
 }
 
+/** Refund pages read for one order: 100 refunds a page (the documented maximum of per_page), so up to 1,000 refunds. */
+export const MAX_REFUND_PAGES = 10;
+
+/**
+ * Every refund of an order. The endpoint is paginated (page and per_page,
+ * 10 a page by default), so the pages are read in turn, 100 at a time, until
+ * X-WP-TotalPages is reached or a page comes back short. `complete` is false
+ * when there are more pages than MAX_REFUND_PAGES.
+ */
 export async function listOrderRefunds(client: UpstreamClient, input: { orderId: number }): Promise<Json> {
-  return { refunds: parseList(refund, await get(client, `${idPath('orders', input.orderId, 'orderId')}/refunds`)) };
+  const path = `${idPath('orders', input.orderId, 'orderId')}/refunds`;
+  const refunds: Array<z.infer<typeof refund>> = [];
+  for (let pageNo = 1; pageNo <= MAX_REFUND_PAGES; pageNo += 1) {
+    const { rows, paging } = await page(client, path, refund, { page: pageNo, per_page: 100 });
+    refunds.push(...rows);
+    const lastPage = paging.totalPages !== undefined ? pageNo >= paging.totalPages : rows.length < 100;
+    if (lastPage || rows.length === 0) return { refunds, complete: true };
+  }
+  return { refunds, complete: false };
 }
 
 /** Statuses an order may be moved to here. Not refunded, failed, pending or trash. */
@@ -481,9 +498,26 @@ export async function createDraftProduct(client: UpstreamClient, input: Json): P
 const PRICE_FIELDS = new Set(['regular_price', 'sale_price']);
 
 /**
+ * A decimal written the shortest way: no leading zeros, no trailing zeros
+ * after the point ("049.50" and 49.5 are "49.5"). Two prices are the same
+ * only when these are equal, so 0.0049 is not 0.00.
+ */
+function decimal(value: unknown): string | undefined {
+  const text = typeof value === 'number' && Number.isFinite(value) ? String(value) : value;
+  if (typeof text !== 'string') return undefined;
+  const match = /^(-?)(\d+)(?:\.(\d+))?$/.exec(text.trim());
+  if (!match) return undefined;
+  const whole = match[2]!.replace(/^0+(?=\d)/, '');
+  const fraction = (match[3] ?? '').replace(/0+$/, '');
+  const sign = match[1] && (whole !== '0' || fraction !== '') ? '-' : '';
+  return `${sign}${whole}${fraction ? `.${fraction}` : ''}`;
+}
+
+/**
  * Whether the answer carries every value that was sent, field by field (in
- * the billing and shipping addresses too). Prices are compared as amounts
- * ("49" is "49.00"), an empty price as empty, texts without surrounding
+ * the billing and shipping addresses too). Prices are compared as exact
+ * decimals ("49" is "49.00", "0.0049" is not "0.00"), an empty price as
+ * empty, texts without surrounding
  * space. A field that is missing or has another value means the change is
  * not confirmed.
  */
@@ -495,9 +529,8 @@ function confirms(answer: unknown, sent: Json): boolean {
     if (typeof value === 'object' && value !== null && !Array.isArray(value)) return confirms(got, value as Json);
     if (PRICE_FIELDS.has(field)) {
       if (value === '') return got === '';
-      const asked = money(value);
-      const answered = money(got);
-      return asked !== undefined && answered !== undefined && Math.abs(asked - answered) < 0.005;
+      const asked = decimal(value);
+      return asked !== undefined && decimal(got) === asked;
     }
     if (typeof value === 'string') return typeof got === 'string' && got.trim() === value.trim();
     return got === value;

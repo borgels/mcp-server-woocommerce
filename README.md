@@ -21,7 +21,7 @@ Reads (on by default):
 | `woocommerce_check_connection` | Check the address and key by reading one order; returns only that it works and the number of orders (`X-WP-Total`). |
 | `woocommerce_get_sales_report` | Totals for a period (`week`, `month`, `last_month`, `year`) or between two dates: sales, orders, items, tax, shipping, refunds, discounts. No customers. |
 | `woocommerce_list_orders` / `woocommerce_get_order` | Orders with the documented filters (status, customer, product, search, after, before), 20 per page by default with the totals; one order with its lines, addresses, the customer's note and refunds. The customer's IP address and browser, the order key, cart hash, transaction id and meta data are left out. |
-| `woocommerce_list_order_notes` / `woocommerce_list_order_refunds` | The notes and the refunds of an order. |
+| `woocommerce_list_order_notes` / `woocommerce_list_order_refunds` | The notes and the refunds of an order. Refunds are read page by page, 100 at a time, up to 1,000; `complete` is false when there are more. |
 | `woocommerce_list_products` / `woocommerce_get_product` | Products with prices, stock and categories. |
 | `woocommerce_list_customers` / `woocommerce_get_customer` | Registered customers with addresses. Username, role and meta data are left out. |
 

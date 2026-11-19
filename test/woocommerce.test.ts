@@ -729,3 +729,69 @@ describe('after review 3: updates are confirmed by the answer', () => {
     }
   });
 });
+
+describe('after review 4', () => {
+  it('reads every page of an order\'s refunds, and says so when there are more than it reads', async () => {
+    const refundPage = (pages: number) => (url: URL) => {
+      const n = Number(url.searchParams.get('page'));
+      const rows = Array.from({ length: n < pages ? 100 : 3 }, (_, i) => ({ id: n * 1000 + i, amount: '1.00', refunded_payment: false }));
+      return Response.json(rows, { headers: { 'X-WP-Total': String((pages - 1) * 100 + 3), 'X-WP-TotalPages': String(pages) } });
+    };
+    const { gw, calls } = shop({ 'GET /orders/727/refunds': refundPage(3) });
+    const result = await call(gw, 'list_order_refunds', { orderId: 727 });
+    expect(result.isError).toBeUndefined();
+    const content = result.structuredContent as { refunds: unknown[]; complete: boolean };
+    expect(content.refunds).toHaveLength(203);
+    expect(content.complete).toBe(true);
+    expect(calls.map(c => [c.query.get('page'), c.query.get('per_page')])).toEqual([
+      ['1', '100'],
+      ['2', '100'],
+      ['3', '100'],
+    ]);
+
+    const many = shop({ 'GET /orders/727/refunds': refundPage(12) });
+    const partial = (await call(many.gw, 'list_order_refunds', { orderId: 727 })).structuredContent as { refunds: unknown[]; complete: boolean };
+    expect(partial.complete).toBe(false);
+    expect(partial.refunds).toHaveLength(1000);
+    expect(many.calls).toHaveLength(10);
+  });
+
+  it('compares a price exactly at the precision sent', async () => {
+    for (const [sent, answered] of [
+      ['0.0049', '0.00'],
+      ['0.0049', '0.0050'],
+      ['49.95', '49.9'],
+      ['49.9501', '49.95'],
+    ] as Array<[string, string]>) {
+      const { gw } = shop({ 'PUT /products/31': { id: 31, regular_price: answered } });
+      expect((await call(gw, 'update_product', { productId: 31, regular_price: sent })).isError, `${sent} ${answered}`).toBe(true);
+    }
+    for (const [sent, answered] of [
+      ['49', '49.00'],
+      ['49.50', '49.5'],
+      ['0.0049', '0.004900'],
+    ] as Array<[string, string]>) {
+      const { gw } = shop({ 'PUT /products/31': { id: 31, regular_price: answered } });
+      expect((await call(gw, 'update_product', { productId: 31, regular_price: sent })).isError, `${sent} ${answered}`).toBeUndefined();
+    }
+  });
+
+  it('refuses a pseudonym key that is not valid UTF-16, with the sealed refusal and no piece of it', () => {
+    const pieces = (key: string) => Array.from({ length: key.length - 5 }, (_, i) => key.slice(i, i + 6));
+    for (const key of [`Qh7Vz2Lr9Xw4Nc8T\uD800p3Yk6Bm1Fs5Jd0Ga`, `\uDC00Wy3Rk8Pq1Zt6Hv9Lc2Xn5Bg7Md4Js0Fe`, `Zr8qLw2Xv7NcT4pK9mYb3HsD6fJgQ1aE\uDBFF`]) {
+      for (const broken of [{}, { shopUrl: 'not a url' }, { consumerKey: 'short' }]) {
+        let caught: Error | undefined;
+        try {
+          createWooCommerceGateway({ consumerKey: KEY, consumerSecret: SECRET, shopUrl: SHOP, ...broken, policy: { pseudonymKey: key } } as never);
+        } catch (error) {
+          caught = error as Error;
+        }
+        expect(caught).toBeInstanceOf(Error);
+        expect(caught!.name).toBe('ConfigError');
+        expect(String(caught!.stack)).toBe(`${caught!.name}: ${caught!.message}`);
+        const text = [caught!.message, caught!.stack, JSON.stringify(caught)].join(' ');
+        for (const piece of pieces(key)) expect(text, piece).not.toContain(piece);
+      }
+    }
+  });
+});

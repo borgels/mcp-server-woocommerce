@@ -310,10 +310,11 @@ export function createWooCommerceGateway(options: WooCommerceGatewayOptions) {
     }),
     ...pseudonymForms,
   ];
-  // Every secret is known to the guard before any validation that can throw.
   let guard: SecretRedactor | undefined = new SecretRedactor();
-  for (const form of pseudonymForms) guard.addSecret(form);
   try {
+    // Every secret is known to the guard before any validation that can throw, and inside the try: whatever
+    // happens while registering it leaves as the sealed error below.
+    for (const form of pseudonymForms) guard.addSecret(form);
     // The pseudonym key is admitted like the shop's key: as text, printable and sharing no piece with any text of
     // ours, so no fixed text (a fallback, an error, the tool list) can carry a piece of it; as bytes, every form
     // of it that is printable text (the bytes read as text, hex, base64) the same way.

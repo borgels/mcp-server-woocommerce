@@ -46,6 +46,10 @@ API v3 documentation (https://woocommerce.github.io/woocommerce-rest-api-docs/).
   refund amount asked for with no money moved by the payment gateway, a
   draft product, a product or customer update with every value sent. The
   pseudonym key is at least 32 characters or bytes, admitted like the
-  shop's key, and known to the error guard before anything is validated.
+  shop's key, and known to the error guard before anything is validated;
+  registering it cannot throw (text that is not valid UTF-16 included).
+  Prices are confirmed as exact decimals at the precision sent. The refunds
+  of an order are read page by page (100 a page, up to 1,000, with
+  `complete`).
 - Not yet run against a live WooCommerce shop: the tests use answers shaped
   as the documentation shows them.

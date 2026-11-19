@@ -62,6 +62,19 @@ const BASE_PATTERNS: readonly RegExp[] = [
  * runs several tenants in one process never mixes their keys, and a tenant's
  * key is released with its instance. There is no process-wide registry.
  */
+/**
+ * The URL-encoded form of a value. encodeURIComponent throws on a lone
+ * surrogate (text that is not valid UTF-16); such a value is encoded as its
+ * well-formed copy instead, so registering a secret never throws.
+ */
+function uriForm(value: string): string {
+  try {
+    return encodeURIComponent(value);
+  } catch {
+    return encodeURIComponent(value.replace(/[\uD800-\uDFFF]/g, '\uFFFD'));
+  }
+}
+
 export class SecretRedactor {
   private readonly secrets = new Set<string>();
   private readonly fragments = new Set<string>();
@@ -72,7 +85,7 @@ export class SecretRedactor {
     if (!value || value.length < MIN_SECRET_LENGTH) {
       return this;
     }
-    for (const form of new Set([value, encodeURIComponent(value), JSON.stringify(value).slice(1, -1)])) {
+    for (const form of new Set([value, uriForm(value), JSON.stringify(value).slice(1, -1)])) {
       this.secrets.add(form);
       for (let i = 0; i + FRAGMENT_LENGTH <= form.length; i += 1) {
         this.fragments.add(form.slice(i, i + FRAGMENT_LENGTH));
