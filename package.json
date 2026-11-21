@@ -1,6 +1,6 @@
 {
   "name": "mcp-server-woocommerce",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "mcpName": "io.github.borgels/mcp-server-woocommerce",
   "description": "Unofficial MCP server for WooCommerce shops: orders, products, customers and sales reports, with opt-in order status, private notes, refunds recorded without moving money, draft products and customer updates.",
   "type": "module",
@@ -16,6 +16,7 @@
     "dist",
     "README.md",
     "LICENSE",
+    "NOTICE",
     "CHANGELOG.md",
     ".env.example"
   ],
@@ -46,7 +47,7 @@
     "denmark"
   ],
   "author": "",
-  "license": "Apache-2.0",
+  "license": "FSL-1.1-ALv2",
   "engines": {
     "node": ">=22.19.0"
   },
