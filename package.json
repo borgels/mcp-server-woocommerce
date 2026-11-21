@@ -1,6 +1,6 @@
 {
   "name": "mcp-server-woocommerce",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "mcpName": "io.github.borgels/mcp-server-woocommerce",
   "description": "Unofficial MCP server for WooCommerce shops: orders, products, customers and sales reports, with opt-in order status, private notes, refunds recorded without moving money, draft products and customer updates.",
   "type": "module",
