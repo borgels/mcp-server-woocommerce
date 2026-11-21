@@ -1,5 +1,5 @@
 import { ConfigError, readEnvBoolean, readEnvInteger, readEnvString, type Env } from '../config-env.js';
-import { WooCommerceHttpError, describeUrl, parseRetryAfterMs, SecretRedactor } from '../errors.js';
+import { WooCommerceHttpError, describeUrl, parseRetryAfterMs, requestIdFrom, SecretRedactor } from '../errors.js';
 import { createHash } from 'node:crypto';
 import { USER_AGENT } from '../version.js';
 import ipaddr from 'ipaddr.js';
@@ -323,6 +323,7 @@ export class WooCommerceClient implements UpstreamClient {
           status: response.status,
           url: describeUrl(url),
           retryAfter: response.headers.get('retry-after') ?? undefined,
+          requestId: requestIdFrom(response.headers),
         });
       }
 
