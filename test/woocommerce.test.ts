@@ -233,6 +233,45 @@ describe('writes', () => {
     expect(result.structuredContent).toEqual({ id: 9, amount: '50.00', reason: '', refunded_payment: false });
   });
 
+  it('refunds a payment through the payment gateway (api_refund true), without restocking, and checks the answer says so', async () => {
+    const paid = {
+      'GET /orders/727': ORDER,
+      'POST /orders/727/refunds': (_url: URL, init: RequestInit) => ({
+        id: 9,
+        amount: (JSON.parse(String(init.body)) as { amount: string }).amount,
+        reason: '',
+        refunded_payment: true,
+      }),
+    };
+    const { gw, calls } = shop(paid);
+    const result = await call(gw, 'refund_payment', { orderId: 727, amount: 50, currency: 'DKK', reason: 'Defekt' });
+    expect(result.isError).toBeUndefined();
+    expect(calls.at(-1)).toMatchObject({
+      method: 'POST',
+      path: '/orders/727/refunds',
+      body: { amount: '50.00', reason: 'Defekt', api_refund: true, api_restock: false },
+    });
+    expect(result.structuredContent).toEqual({ id: 9, amount: '50.00', reason: '', refunded_payment: true });
+
+    // An answer that says the gateway did not pay it back is not reported as done; nor is a recorded refund that did.
+    const { gw: unpaid } = shop(refundRoutes({}));
+    expect((await call(unpaid, 'refund_payment', { orderId: 727, amount: 50, currency: 'DKK' })).isError).toBe(true);
+    const { gw: moved } = shop(paid);
+    expect((await call(moved, 'record_refund', { orderId: 727, amount: 50, currency: 'DKK' })).isError).toBe(true);
+  });
+
+  it('refuses a payment refund of more than is left, or in another currency, without sending it', async () => {
+    for (const [order, amount] of [
+      [{ refunds: [{ id: 1, total: '-60.00' }] }, 50.01],
+      [{ currency: 'EUR' }, 10],
+      [{ status: 'pending' }, 10],
+    ] as const) {
+      const { gw, calls } = shop(refundRoutes(order));
+      expect((await call(gw, 'refund_payment', { orderId: 727, amount, currency: 'DKK' })).isError).toBe(true);
+      expect(calls.some(c => c.method === 'POST')).toBe(false);
+    }
+  });
+
   it.each([
     ['more than is left after earlier refunds', { refunds: [{ id: 1, total: '-60.00' }] }, 50.01],
     ['more than the order total', {}, 100.01],
@@ -343,6 +382,17 @@ describe('change resolution for a host log', () => {
         action: 'record_refund',
         record: 'refund',
         movesMoney: false,
+        requiresConfirmation: false,
+        values: { orderId: 727, amount: 50.5, currency: 'DKK' },
+      },
+    });
+    expect(resolveWooCommerceChange('refund_payment', { orderId: 727, amount: 50.5, currency: 'DKK', reason: 'Jens Jensen ringede' })).toEqual({
+      ok: true,
+      change: {
+        tool: 'refund_payment',
+        action: 'refund_payment',
+        record: 'refund',
+        movesMoney: true,
         requiresConfirmation: true,
         values: { orderId: 727, amount: 50.5, currency: 'DKK' },
       },
@@ -364,8 +414,9 @@ describe('change resolution for a host log', () => {
     expect(resolveWooCommerceChange('delete_order', {}).ok).toBe(false);
   });
 
-  it('marks only record_refund as needing a person to confirm', () => {
-    expect(wooCommerceToolCatalog.filter(entry => entry.requiresConfirmation).map(entry => entry.name)).toEqual(['record_refund']);
+  it('marks only refund_payment, which moves money, as needing a person to confirm', () => {
+    expect(wooCommerceToolCatalog.filter(entry => entry.requiresConfirmation).map(entry => entry.name)).toEqual(['refund_payment']);
+    expect(wooCommerceToolCatalog.filter(entry => entry.change?.movesMoney).map(entry => entry.name)).toEqual(['refund_payment']);
   });
 });
 

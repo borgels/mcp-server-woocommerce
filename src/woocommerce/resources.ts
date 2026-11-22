@@ -395,6 +395,32 @@ export async function recordRefund(
   client: UpstreamClient,
   input: { orderId: number; amount: number; currency: string; reason?: string },
 ): Promise<Json> {
+  return createRefund(client, input, false);
+}
+
+/**
+ * Refund money on an order through the order's payment gateway: the refund
+ * is created with `api_refund` true, so WooCommerce asks the payment gateway
+ * to pay the amount back to the customer, and `api_restock` false. This
+ * moves money, so the tool is marked requiresConfirmation: a host should
+ * have a person confirm each call outside the chat. When the gateway cannot
+ * refund, WooCommerce answers with an error and keeps no refund.
+ *
+ * The same checks as recordRefund before anything is sent, and the answer
+ * must say that the payment was refunded.
+ */
+export async function refundPayment(
+  client: UpstreamClient,
+  input: { orderId: number; amount: number; currency: string; reason?: string },
+): Promise<Json> {
+  return createRefund(client, input, true);
+}
+
+async function createRefund(
+  client: UpstreamClient,
+  input: { orderId: number; amount: number; currency: string; reason?: string },
+  throughGateway: boolean,
+): Promise<Json> {
   const path = idPath('orders', input.orderId, 'orderId');
   return serialised(`${client.shopIdentity()}:refund:${input.orderId}`, async () => {
     const current = parse(order, await get(client, path), input.orderId);
@@ -418,15 +444,16 @@ export async function recordRefund(
       await client.post(`${path}/refunds`, {
         amount: input.amount.toFixed(2),
         ...(input.reason ? { reason: input.reason } : {}),
-        api_refund: false,
+        api_refund: throughGateway,
         api_restock: false,
       }),
     );
-    // The answer must be the refund asked for: the same amount, and no money moved by the payment gateway.
+    // The answer must be the refund asked for: the same amount, and money moved by the payment gateway exactly when
+    // that was asked for.
     const created = parse(refund, body);
     const answered = money(created.amount);
     if (answered === undefined || Math.abs(answered - input.amount) > 0.005) throw new UnexpectedAnswerError();
-    if (created.refunded_payment !== false) throw new UnexpectedAnswerError();
+    if (created.refunded_payment !== throughGateway) throw new UnexpectedAnswerError();
     return created;
   });
 }

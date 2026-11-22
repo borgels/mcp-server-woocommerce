@@ -195,6 +195,7 @@ const SAMPLE_INPUTS: Record<string, GatewayJsonObject> = {
   update_order_status: { orderId: 12, status: 'completed' },
   add_order_note: { orderId: 12, note: 'Packed' },
   record_refund: { orderId: 12, amount: 50, currency: 'DKK' },
+  refund_payment: { orderId: 12, amount: 50, currency: 'DKK' },
   create_draft_product: { name: 'New product', regular_price: '100.00' },
   update_product: { productId: 31, stock_quantity: 4, manage_stock: true },
   update_customer: { customerId: 21, billing: { phone: '12345678' } },
@@ -219,8 +220,8 @@ async function catalogFetch(input: string | URL | Request, init?: RequestInit): 
     return Response.json({ id: Number(/(\d+)$/.exec(path)?.[1]), ...(JSON.parse(String(init?.body)) as object) });
   }
   if (method === 'POST' && path.endsWith('/refunds')) {
-    const { amount } = JSON.parse(String(init?.body)) as { amount: string };
-    return Response.json({ id: 1, amount, refunded_payment: false });
+    const { amount, api_refund } = JSON.parse(String(init?.body)) as { amount: string; api_refund: boolean };
+    return Response.json({ id: 1, amount, refunded_payment: api_refund });
   }
   return Response.json({ id: recordId ? Number(recordId) : 1 });
 }

@@ -28,6 +28,7 @@ import {
   MAX_PER_PAGE,
   ORDER_STATUSES,
   recordRefund,
+  refundPayment,
   SETTABLE_ORDER_STATUSES,
   updateCustomer,
   updateOrderStatus,
@@ -64,7 +65,7 @@ export interface RedactingClient extends UpstreamClient {
 }
 
 /** What a write tool does. */
-export type WooCommerceChangeAction = 'create' | 'update' | 'set_status' | 'add_note' | 'record_refund';
+export type WooCommerceChangeAction = 'create' | 'update' | 'set_status' | 'add_note' | 'record_refund' | 'refund_payment';
 
 /** The kind of record a write tool touches. */
 export type WooCommerceChangeRecord = 'order' | 'order_note' | 'refund' | 'product' | 'customer';
@@ -98,8 +99,11 @@ export interface WooCommerceLogField {
 export interface WooCommerceChangeSpec {
   readonly action: WooCommerceChangeAction;
   readonly record: WooCommerceChangeRecord;
-  /** Always false: no tool moves money. A recorded refund is an entry in the shop; api_refund is false. */
-  readonly movesMoney: false;
+  /**
+   * True only for refund_payment, which has the payment gateway pay money back (api_refund true). A recorded refund
+   * (record_refund) is an entry in the shop; api_refund is false.
+   */
+  readonly movesMoney: boolean;
   readonly logFields: readonly WooCommerceLogField[];
 }
 
@@ -126,7 +130,7 @@ export interface ToolDefinition<S extends z.ZodRawShape = z.ZodRawShape> {
   broad?: boolean;
   /** Write tools: what the change does. */
   change?: WooCommerceChangeSpec;
-  /** True when a person should confirm each call outside the chat before it runs: recording a refund. */
+  /** True when a person should confirm each call outside the chat before it runs: a refund that moves money. */
   requiresConfirmation?: boolean;
   /** Cross-field checks the schema shape cannot express. Returns a refusal or undefined. */
   check?: (input: Record<string, unknown>) => string | undefined;
@@ -152,10 +156,11 @@ const change = (
   action: WooCommerceChangeAction,
   record: WooCommerceChangeRecord,
   logFields: Record<string, WooCommerceLogFieldType>,
+  movesMoney = false,
 ): WooCommerceChangeSpec => ({
   action,
   record,
-  movesMoney: false,
+  movesMoney,
   logFields: Object.entries(logFields).map(([name, type]) => ({ name, type })),
 });
 
@@ -193,6 +198,17 @@ const productFieldsShape = {
   stock_quantity: z.number().int().min(0).max(10_000_000).optional().describe('Stock quantity (with manage_stock).'),
   stock_status: z.enum(['instock', 'outofstock', 'onbackorder']).optional(),
 };
+
+/** The input of a refund: recorded only (record_refund) or paid back through the payment gateway (refund_payment). */
+const refundShape = (amountText: string) => ({
+  orderId: recordId('The order id.'),
+  amount: z
+    .number()
+    .refine(isAmount, `must be more than 0 and at most ${MAX_AMOUNT}, with at most two decimals`)
+    .describe(amountText),
+  currency: z.string().trim().regex(CURRENCY_PATTERN).describe("The order's currency, e.g. DKK, as a check."),
+  reason: text(500).optional().describe('Reason for the refund, kept on the order.'),
+});
 
 function atLeastOneChange(fields: readonly string[]) {
   return (input: Record<string, unknown>): string | undefined =>
@@ -389,16 +405,8 @@ export const WOOCOMMERCE_TOOLS: ToolDefinition[] = [
   defineTool({
     name: 'woocommerce_record_refund',
     title: 'Record refund (WooCommerce)',
-    description: `Record a refund on an order in the shop, without paying any money back: api_refund is always false, so the payment gateway is not asked to refund. The money is refunded by a person in the payment provider. Stock is not restocked. Reads the order first and refuses when it is not processing, on-hold or completed, the currency differs, or the amount is more than is left to refund. Refunds of one order run one at a time in this server. A person should confirm each call. ${WRITE_NOTE}`,
-    inputShape: {
-      orderId: recordId('The order id.'),
-      amount: z
-        .number()
-        .refine(isAmount, `must be more than 0 and at most ${MAX_AMOUNT}, with at most two decimals`)
-        .describe('Amount to record as refunded, in the order currency.'),
-      currency: z.string().trim().regex(CURRENCY_PATTERN).describe("The order's currency, e.g. DKK, as a check."),
-      reason: text(500).optional().describe('Reason for the refund, kept on the order.'),
-    },
+    description: `Record a refund on an order in the shop, without paying any money back: api_refund is always false, so the payment gateway is not asked to refund. The money is refunded by a person in the payment provider, or with refund_payment. Stock is not restocked. Reads the order first and refuses when it is not processing, on-hold or completed, the currency differs, or the amount is more than is left to refund. Refunds of one order run one at a time in this server. ${WRITE_NOTE}`,
+    inputShape: refundShape('Amount to record as refunded, in the order currency.'),
     annotations: WRITE_TOOL_ANNOTATIONS,
     returnsUpstreamContent: true,
     summary: 'Recorded refund.',
@@ -407,8 +415,23 @@ export const WOOCOMMERCE_TOOLS: ToolDefinition[] = [
       { access: 'write', method: 'POST', path: '/orders/{orderId}/refunds' },
     ],
     change: change('record_refund', 'refund', { orderId: 'recordId', amount: 'amount', currency: 'currency' }),
-    requiresConfirmation: true,
     handler: async (client, input) => recordRefund(client, input),
+  }),
+  defineTool({
+    name: 'woocommerce_refund_payment',
+    title: 'Refund payment through the payment gateway (WooCommerce)',
+    description: `Refund money on an order to the customer through the order's payment gateway: the refund is created with api_refund true, so the payment gateway pays the amount back. This moves money and cannot be undone; a person should confirm each call outside the chat. When the gateway cannot refund, the shop answers with an error and keeps no refund. Stock is not restocked. Reads the order first and refuses when it is not processing, on-hold or completed, the currency differs, or the amount is more than is left to refund. Refunds of one order run one at a time in this server. ${WRITE_NOTE}`,
+    inputShape: refundShape('Amount to pay back, in the order currency.'),
+    annotations: WRITE_TOOL_ANNOTATIONS,
+    returnsUpstreamContent: true,
+    summary: 'Refunded payment.',
+    upstream: [
+      { access: 'read', method: 'GET', path: '/orders/{orderId}' },
+      { access: 'write', method: 'POST', path: '/orders/{orderId}/refunds' },
+    ],
+    change: change('refund_payment', 'refund', { orderId: 'recordId', amount: 'amount', currency: 'currency' }, true),
+    requiresConfirmation: true,
+    handler: async (client, input) => refundPayment(client, input),
   }),
   defineTool({
     name: 'woocommerce_create_draft_product',
