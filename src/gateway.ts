@@ -53,9 +53,12 @@ import {
  *
  * What no policy can turn on: a request outside the client's fixed list of
  * writes (src/woocommerce/client.ts, ALLOWED_WRITES). There is no DELETE, no
- * refund through a payment gateway (a refund is recorded with api_refund
- * false), no batch endpoint, and no tool that changes settings, users,
- * coupons or payment methods.
+ * batch endpoint, and no tool that changes settings, users, coupons or
+ * payment methods. One tool moves money: refund_payment has the order's
+ * payment gateway pay a refund back (api_refund true). It is marked
+ * requiresConfirmation and movesMoney, so a host can have a person confirm
+ * each call outside the chat; record_refund records a refund without moving
+ * money (api_refund false).
  */
 
 export type { AuditSink, InstancePolicy } from './woocommerce/policy.js';
@@ -127,7 +130,8 @@ export interface GatewayToolCatalogEntry {
   readonly broad: boolean;
   /**
    * True for a tool a person should confirm outside the chat before it runs:
-   * recording a refund (it records a refund in the shop; no money moves).
+   * refund_payment, which has the payment gateway pay money back. Recording
+   * a refund (record_refund) moves no money and is not marked.
    */
   readonly requiresConfirmation: boolean;
   /**
@@ -228,7 +232,8 @@ export interface WooCommerceChange {
   readonly tool: string;
   readonly action: WooCommerceChangeAction;
   readonly record: WooCommerceChangeRecord;
-  readonly movesMoney: false;
+  /** True only for refund_payment (the payment gateway pays money back). */
+  readonly movesMoney: boolean;
   readonly requiresConfirmation: boolean;
   /**
    * The values of the tool's `logFields` that are present and have their
@@ -277,7 +282,7 @@ export function resolveWooCommerceChange(
       tool: stripPrefix(tool.name),
       action: tool.change.action,
       record: tool.change.record,
-      movesMoney: false as const,
+      movesMoney: tool.change.movesMoney,
       requiresConfirmation: tool.requiresConfirmation === true,
       values: Object.freeze(values),
     }),

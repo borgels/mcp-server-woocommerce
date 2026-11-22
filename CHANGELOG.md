@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.4.0
+
+- New write tool `woocommerce_refund_payment`: refunds money on an order
+  through the order's payment gateway (`api_refund: true`, `api_restock:
+  false`), with the same checks as `woocommerce_record_refund` before anything
+  is sent; the answer must say the payment was refunded. It is the only tool
+  that moves money: marked `requiresConfirmation` and `change.movesMoney`, so a
+  host can have a person confirm each call outside the chat. The client's
+  fixed list of writes is unchanged.
+- `woocommerce_record_refund` is no longer marked `requiresConfirmation`: it
+  moves no money (`api_refund` is always false), #16.
+- `WooCommerceChangeSpec.movesMoney` and `WooCommerceChange.movesMoney` are
+  `boolean` (were `false`).
+
 ## 0.3.1
 
 - Licensor and copyright holder corrected to Borgels Services ApS in `LICENSE`,

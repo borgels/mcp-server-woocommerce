@@ -186,6 +186,7 @@ describe('gateway export', () => {
       'update_order_status',
       'add_order_note',
       'record_refund',
+      'refund_payment',
       'create_draft_product',
       'update_product',
       'update_customer',
